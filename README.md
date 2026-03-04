@@ -53,13 +53,25 @@ See [docs/tmux.md](docs/tmux.md) for keybindings, status bar setup, hook events,
 
 ## Dependencies
 
-| Tool | Required | Used by |
-|------|----------|---------|
-| tmux 3.2+ | yes | everything |
-| sound player (afplay/paplay/aplay/pw-play) | optional | sounds (silent fallback) |
-| [glow](https://github.com/charmbracelet/glow) | optional | `g,m` and `g,n` |
-| [beads](https://github.com/steveyegge/beads) | optional | `g,b` and tmux-claim-bead |
-| [delta](https://github.com/dandavison/delta) | optional | `g,d` (falls back to less) |
+### Required
+
+| Tool | Install |
+|------|---------|
+| tmux 3.2+ | `brew install tmux` / `apt install tmux` |
+| python3 | usually pre-installed |
+| jq | `brew install jq` / `apt install jq` |
+
+### Optional
+
+| Tool | Used by | Fallback | Install |
+|------|---------|----------|---------|
+| [gum](https://github.com/charmbracelet/gum) | interactive popups | tmux display-menu | `brew install gum` |
+| [glow](https://github.com/charmbracelet/glow) | `g,m` markdown, `g,n` notes | — | `brew install glow` |
+| [delta](https://github.com/dandavison/delta) | `g,d` diffs | less | `brew install delta` |
+| [bat](https://github.com/sharkdp/bat) | file viewer | less | `brew install bat` |
+| [beads](https://github.com/steveyegge/beads) | `g,b` task dashboard | — | see repo |
+| sound player | audio alerts | silent | afplay (macOS), paplay/pw-play/aplay (Linux) |
+| [textual](https://github.com/Textualize/textual) | TUI popups (`bauble-ui`) | gum / display-menu | `pip install ./tui` |
 
 ## Other useful things
 

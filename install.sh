@@ -78,6 +78,21 @@ if ! command -v tmux &>/dev/null; then
   exit 1
 fi
 
+if ! command -v python3 &>/dev/null; then
+  echo -e "${RED}Error:${RESET} python3 is required but not found."
+  exit 1
+fi
+
+if ! command -v jq &>/dev/null; then
+  echo -e "${RED}Error:${RESET} jq is required but not found."
+  if [[ "$(uname)" == "Darwin" ]]; then
+    echo "  Install with: brew install jq"
+  else
+    echo "  Install with your package manager (e.g. apt install jq)"
+  fi
+  exit 1
+fi
+
 # --- File manifest ---
 FILES=(
   "hooks/pane-tint.sh:$HOME/.claude/hooks/pane-tint.sh"
@@ -223,14 +238,21 @@ else
   fi
 fi
 
-# Check for glow
-if ! command -v glow &>/dev/null; then
+# Check for optional dependencies
+_missing=()
+command -v glow &>/dev/null || _missing+=("glow (markdown viewer)")
+command -v gum &>/dev/null || _missing+=("gum (interactive filtering)")
+command -v delta &>/dev/null || _missing+=("delta (syntax-highlighted diffs)")
+command -v bat &>/dev/null || _missing+=("bat (syntax-highlighted file viewer)")
+
+if [[ ${#_missing[@]} -gt 0 ]]; then
   echo ""
-  echo -e "  ${YELLOW}Note:${RESET} glow not found. tmux-glow requires it."
+  echo -e "  ${YELLOW}Optional dependencies not found:${RESET}"
+  for dep in "${_missing[@]}"; do
+    echo "    - $dep"
+  done
   if [[ "$(uname)" == "Darwin" ]]; then
-    echo -e "  ${BOLD}brew install glow${RESET}"
-  else
-    echo -e "  ${BOLD}See https://github.com/charmbracelet/glow#installation${RESET}"
+    echo -e "  ${BOLD}brew install glow gum delta bat${RESET}"
   fi
 fi
 echo ""
