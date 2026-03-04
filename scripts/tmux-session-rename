@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# tmux-session-rename: name a Claude session for easy identification
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to tmux prefix+g, r. Opens a gum input popup to set a human-friendly
+# name for the current Claude session. Name is stored as:
+#   1. @claude-name tmux pane option (fast reads by display scripts)
+#   2. session-map.json entry (persistent metadata)
+#   3. tmux window title (visible in tab bar)
+#
+# Pane ID passed as $1 — tmux expands #{pane_id} in keybinding before popup.
+# Requires: gum (https://github.com/charmbracelet/gum)
+
+set -euo pipefail
+
+# Ensure PATH includes common tool locations (popup shells may not source profile)
+for p in /opt/homebrew/bin "$HOME/.claude/scripts"; do
+  [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && PATH="$p:$PATH"
+done
+
+PANE="${1:-}"
+if [[ -z "$PANE" ]]; then
+  echo "Usage: tmux-session-rename <pane_id>"
+  exit 1
+fi
+
+# Try Textual UI first (already inside a tmux popup from keybinding)
+if command -v bauble-ui &>/dev/null; then
+  exec bauble-ui rename "$PANE"
+fi
+
+SESSION_MAP="$HOME/.claude/hooks/session-map.json"
+
+# Read current name for pre-fill
+CURRENT_NAME=$(tmux show-option -p -t "$PANE" -qv @claude-name 2>/dev/null || true)
+
+# Header
+gum style --border rounded --border-foreground 39 --padding "0 2" \
+  --foreground 39 --bold "Name Session"
+
+echo ""
+
+# Prompt for name (pre-fill current name for edits)
+INPUT_ARGS=(--placeholder "e.g. pricing API, cancel detection"
+  --prompt "  " --prompt.foreground 39 --width 44)
+[[ -n "$CURRENT_NAME" ]] && INPUT_ARGS+=(--value "$CURRENT_NAME")
+
+NAME=$(gum input "${INPUT_ARGS[@]}") || exit 0
+
+# Trim whitespace
+NAME=$(echo "$NAME" | xargs)
+
+if [[ -z "$NAME" ]]; then
+  # Empty input = clear the name
+  tmux set-option -p -t "$PANE" -qu @claude-name 2>/dev/null
+  # Restore default window name from cwd
+  CWD=$(tmux show-option -p -t "$PANE" -qv @claude-cwd 2>/dev/null || true)
+  if [[ -n "$CWD" ]]; then
+    WINDOW=$(tmux display-message -p -t "$PANE" '#{window_id}' 2>/dev/null)
+    tmux rename-window -t "$WINDOW" "$(basename "$CWD")" 2>/dev/null || true
+  fi
+  echo ""
+  gum style --foreground 241 "  Name cleared"
+  sleep 1
+else
+  # Set pane option
+  tmux set-option -p -t "$PANE" @claude-name "$NAME" 2>/dev/null
+
+  # Set window title (truncate to 20 chars + "..." if needed)
+  if [[ ${#NAME} -le 20 ]]; then
+    TAB_TITLE="$NAME"
+  else
+    TAB_TITLE="${NAME:0:20}..."
+  fi
+  WINDOW=$(tmux display-message -p -t "$PANE" '#{window_id}' 2>/dev/null)
+  tmux rename-window -t "$WINDOW" "$TAB_TITLE" 2>/dev/null || true
+
+  echo ""
+  gum style --foreground 78 "  Named → $NAME"
+  sleep 1
+fi
+
+# Update session-map.json with name + enrichment snapshot
+SESSION_ID=$(tmux show-option -p -t "$PANE" -qv @claude-session 2>/dev/null || true)
+[[ -z "$SESSION_ID" ]] && exit 0
+
+# Best-effort enrichment
+CWD=$(tmux show-option -p -t "$PANE" -qv @claude-cwd 2>/dev/null || true)
+GIT_BRANCH=""
+GIT_WORKTREE=""
+ACTIVE_BEAD=""
+CULLIS_YOLO="false"
+CULLIS_PROFILE=""
+REMIS_SESSION=""
+
+if [[ -n "$CWD" ]] && [[ -d "$CWD/.git" || -f "$CWD/.git" ]]; then
+  GIT_BRANCH=$(git -C "$CWD" branch --show-current 2>/dev/null || true)
+  # Detect worktree: .git is a file (not dir) in worktrees
+  if [[ -f "$CWD/.git" ]]; then
+    GIT_WORKTREE=$(grep -oP 'gitdir: \K.*' "$CWD/.git" 2>/dev/null | sed 's|/\.git/worktrees/.*||' || true)
+    GIT_WORKTREE=$(basename "$GIT_WORKTREE" 2>/dev/null || true)
+  fi
+fi
+
+# Active bead (from tmux window name if it looks like a bead ID)
+WINDOW_NAME=$(tmux display-message -p -t "$PANE" '#{window_name}' 2>/dev/null || true)
+if [[ "$WINDOW_NAME" =~ ^[A-Za-z]+-[a-z0-9]+$ ]]; then
+  ACTIVE_BEAD="$WINDOW_NAME"
+fi
+
+# Cullis state
+if [[ -f "$HOME/.claude/hooks/cullis-yolo.json" ]]; then
+  CULLIS_YOLO=$(python3 -c "
+import json, time
+try:
+    with open('$HOME/.claude/hooks/cullis-yolo.json') as f:
+        d = json.load(f)
+    print('true' if d.get('expires', 0) > time.time() else 'false')
+except: print('false')
+" 2>/dev/null || echo "false")
+fi
+CULLIS_PROFILE=$(tmux show-option -p -t "$PANE" -qv @cullis-profile 2>/dev/null || true)
+
+# Remis session
+REMIS_SESSION=$(tmux show-option -p -t "$PANE" -qv @remis-session 2>/dev/null || true)
+
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+python3 -c "
+import json, os, sys
+
+map_path = '$SESSION_MAP'
+session_id = '$SESSION_ID'
+name = '''$NAME'''
+now = '$NOW'
+git_branch = '$GIT_BRANCH' or None
+git_worktree = '$GIT_WORKTREE' or None
+active_bead = '$ACTIVE_BEAD' or None
+cullis_yolo = '$CULLIS_YOLO' == 'true'
+cullis_profile = '$CULLIS_PROFILE' or None
+remis_session = '$REMIS_SESSION' or None
+
+try:
+    with open(map_path) as f:
+        data = json.load(f)
+except (OSError, json.JSONDecodeError):
+    data = {}
+
+name_index = data.get('_name_index', {})
+
+if session_id in data and isinstance(data[session_id], dict):
+    entry = data[session_id]
+    # Remove old name from index
+    old_name = entry.get('name')
+    if old_name and name_index.get(old_name) == session_id:
+        del name_index[old_name]
+else:
+    entry = {}
+
+# Update fields
+if name:
+    entry['name'] = name
+    entry['named_at'] = now
+    name_index[name] = session_id
+else:
+    entry.pop('name', None)
+    entry.pop('named_at', None)
+
+# Enrichment snapshot
+entry['git_branch'] = git_branch
+entry['git_worktree'] = git_worktree
+entry['active_bead'] = active_bead
+entry['cullis_yolo'] = cullis_yolo
+entry['cullis_profile'] = cullis_profile
+entry['remis_session'] = remis_session
+
+data[session_id] = entry
+data['_name_index'] = name_index
+
+tmp = map_path + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+os.replace(tmp, map_path)
+" 2>/dev/null
+
+exit 0

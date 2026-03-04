@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# tmux-claude-next: cycle to next waiting Claude pane
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to prefix+Home. Finds the next pane with @bauble-state=waiting
+# in global ordering (session, window, pane), wrapping around.
+# Records a breadcrumb for the origin pane before navigating away.
+
+set -euo pipefail
+
+BREADCRUMBS="$HOME/.claude/hooks/bauble-breadcrumbs.json"
+CURRENT_PANE=$(tmux display-message -p '#{pane_id}' 2>/dev/null)
+CURRENT_SESSION=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+
+# Enumerate all Claude panes in global order
+pane_data=$(tmux list-panes -a -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_id}' 2>/dev/null | sort -t'	' -k1,1 -k2,2n -k3,3n)
+
+if [ -z "$pane_data" ]; then
+  tmux display-message "No Claude sessions"
+  exit 0
+fi
+
+# Collect waiting panes and all Claude panes (for position tracking)
+all_claude_panes=()
+waiting_panes=()
+
+while IFS=$'\t' read -r session window pane_idx pane_id; do
+  state=$(tmux show-option -p -t "$pane_id" -qv @bauble-state 2>/dev/null)
+  [ -z "$state" ] && continue
+  all_claude_panes+=("$pane_id")
+  [ "$state" = "waiting" ] && waiting_panes+=("$pane_id")
+done <<< "$pane_data"
+
+if [ ${#waiting_panes[@]} -eq 0 ]; then
+  tmux display-message "No agents waiting"
+  exit 0
+fi
+
+# Find current pane's position in global ordering
+current_idx=-1
+for i in "${!all_claude_panes[@]}"; do
+  if [ "${all_claude_panes[$i]}" = "$CURRENT_PANE" ]; then
+    current_idx=$i
+    break
+  fi
+done
+
+# Pick next waiting pane after current position (wrap around)
+target=""
+total=${#all_claude_panes[@]}
+for offset in $(seq 1 "$total"); do
+  check_idx=$(( (current_idx + offset) % total ))
+  check_pane="${all_claude_panes[$check_idx]}"
+  for wp in "${waiting_panes[@]}"; do
+    if [ "$wp" = "$check_pane" ]; then
+      target="$check_pane"
+      break 2
+    fi
+  done
+done
+
+# Fallback: just pick first waiting pane
+[ -z "$target" ] && target="${waiting_panes[0]}"
+
+# Record breadcrumb for origin pane (unless we got here by cycling)
+via_cycle=$(tmux show-option -p -t "$CURRENT_PANE" -qv @bauble-nav-via-cycle 2>/dev/null)
+if [ "$via_cycle" != "1" ]; then
+  window_name=$(tmux display-message -p '#{window_name}' 2>/dev/null)
+  python3 -c "
+import json, os, time
+
+path = '$BREADCRUMBS'
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (OSError, json.JSONDecodeError):
+    data = []
+
+data.append({
+    'pane_id': '$CURRENT_PANE',
+    'session': '$CURRENT_SESSION',
+    'window_name': '$window_name',
+    'timestamp': time.time()
+})
+
+# Keep last 100
+data = data[-100:]
+
+tmp = path + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(data, f)
+    f.write('\n')
+os.replace(tmp, path)
+" 2>/dev/null
+fi
+
+# Clear cycle flag on origin, set on target
+tmux set-option -p -t "$CURRENT_PANE" -qu @bauble-nav-via-cycle 2>/dev/null
+tmux set-option -p -t "$target" -q @bauble-nav-via-cycle 1 2>/dev/null
+
+# Store origin pane on target for auto-return after permission approval.
+# pane-tint.sh checks this on waiting→working transition and navigates back.
+tmux set-option -p -t "$target" -q @claude-origin-pane "$CURRENT_PANE" 2>/dev/null
+tmux set-option -p -t "$target" -q @claude-origin-session "$CURRENT_SESSION" 2>/dev/null
+
+# Navigate to target
+target_session=$(tmux display-message -p -t "$target" '#{session_name}' 2>/dev/null)
+[ "$target_session" != "$CURRENT_SESSION" ] && tmux switch-client -t "$target_session" 2>/dev/null
+tmux select-window -t "$target" 2>/dev/null
+tmux select-pane -t "$target" 2>/dev/null

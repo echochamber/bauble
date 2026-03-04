@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# tmux-worktree: worktree picker for tmux
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to tmux prefix+w. Shows active git worktrees in a filterable popup
+# (gum filter) or display-menu fallback. Selects to open/switch to worktree.
+#
+# Modes:
+#   (default)  Launch popup with gum filter, or fall back to display-menu
+#   --popup    Runs inside the tmux popup: enumerate → gum filter → act
+#   --open     Navigate to a worktree (called from selection handler)
+
+set -euo pipefail
+
+SELF="$HOME/.claude/scripts/tmux-worktree"
+
+# ── --open handler: navigate to a worktree ──
+if [[ "${1:-}" == "--open" ]]; then
+  wt_path="${2:-}"
+  existing_window="${3:-}"
+  if [ -n "$existing_window" ] && [ "$existing_window" != "_" ]; then
+    tmux select-window -t ":$existing_window" 2>/dev/null
+  else
+    tmux new-window -c "$wt_path" 2>/dev/null
+  fi
+  exit 0
+fi
+
+if ! git rev-parse --git-dir &>/dev/null 2>&1; then
+  tmux display-message "Not in a git repository"
+  exit 0
+fi
+
+# ── Default mode (no args): launch popup or fall back ──
+if [[ "${1:-}" != "--popup" ]]; then
+  # Try Textual UI first (fastest, best UX)
+  if command -v bauble-ui &>/dev/null; then
+    tmux display-popup -w 70 -h 18 -E "bauble-ui worktree"
+    exit 0
+  fi
+  if command -v gum &>/dev/null; then
+    tmux display-popup -w 70 -h 18 -E "bash -l '${SELF}' --popup"
+  else
+    _USE_MENU=1
+  fi
+  [ "${_USE_MENU:-}" != "1" ] && exit 0
+fi
+
+# ── Shared: enumerate worktrees ──
+# Reached by: --popup mode (inside popup) or display-menu fallback
+
+# Ensure PATH includes common tool locations (popup shells may not source profile)
+for p in /opt/homebrew/bin /usr/local/bin "$HOME/.claude/scripts"; do
+  [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && PATH="$p:$PATH"
+done
+
+worktrees=$(git worktree list --porcelain 2>/dev/null | grep '^worktree ' | sed 's/^worktree //')
+
+if [ -z "$worktrees" ]; then
+  [[ "${1:-}" == "--popup" ]] && echo "No worktrees found" && sleep 1
+  [[ "${1:-}" != "--popup" ]] && tmux display-message "No worktrees found"
+  exit 0
+fi
+
+count=$(echo "$worktrees" | wc -l | tr -d ' ')
+
+if [ "$count" -eq 1 ]; then
+  [[ "${1:-}" == "--popup" ]] && echo "Only one worktree (main)" && sleep 1
+  [[ "${1:-}" != "--popup" ]] && tmux display-message "Only one worktree (main)"
+  exit 0
+fi
+
+# Escape single quotes for tmux run-shell arguments
+sq() { local s="$1"; echo "${s//\'/\'\\\'\'}"; }
+
+# Build worktree info with window associations
+DELIM="┊"
+lines=()
+menu_args=()
+
+while IFS= read -r wt_path; do
+  dir_name=$(basename "$wt_path")
+  # Get branch name from porcelain output
+  branch=$(git worktree list --porcelain 2>/dev/null | awk -v wt="$wt_path" '
+    $1 == "worktree" && $2 == wt { found=1; next }
+    found && /^branch / { sub(/^branch refs\/heads\//, ""); print; exit }
+    found && /^worktree / { exit }
+  ')
+  [ -z "$branch" ] && branch="$dir_name"
+
+  # Check if a tmux window already exists for this path
+  existing_window=$(tmux list-windows -F '#{window_index} #{pane_current_path}' 2>/dev/null | grep "$wt_path" | head -1 | awk '{print $1}')
+  win_label=""
+  [ -n "$existing_window" ] && win_label="(win $existing_window)"
+
+  # For gum filter
+  display="${dir_name}"
+  [ -n "$win_label" ] && display="${dir_name} ${win_label}"
+  lines+=("${display} ${DELIM}${wt_path}${DELIM}${existing_window:-_}")
+
+  # For display-menu fallback
+  if [ -n "$existing_window" ]; then
+    menu_args+=("$dir_name (win $existing_window)" "" "run-shell -b '$(sq "$SELF") --open $(sq "$wt_path") $(sq "$existing_window")'")
+  else
+    menu_args+=("$dir_name" "" "run-shell -b '$(sq "$SELF") --open $(sq "$wt_path") _'")
+  fi
+done <<< "$worktrees"
+
+# ── --popup mode: gum filter inside the tmux popup ──
+if [[ "${1:-}" == "--popup" ]]; then
+  if [ ${#lines[@]} -eq 0 ]; then
+    echo "No worktrees found."
+    sleep 1
+    exit 0
+  fi
+
+  selected=$(printf '%s\n' "${lines[@]}" | gum filter \
+    --fuzzy \
+    --header "Worktrees  (type to filter)" \
+    --header.foreground 99 \
+    --placeholder "Filter..." \
+    --prompt "> " \
+    --prompt.foreground 99 \
+    --indicator.foreground 99 \
+    --select-if-one \
+    --strict \
+    --height 15 \
+    --width 0) || exit 0
+
+  # Extract metadata from delimiter-separated suffix
+  existing="${selected##*${DELIM}}"
+  rest="${selected%${DELIM}${existing}}"
+  wt_path="${rest##*${DELIM}}"
+
+  if [ -n "$wt_path" ]; then
+    exec "$SELF" --open "$wt_path" "$existing"
+  fi
+  exit 0
+fi
+
+# ── Display-menu fallback (no gum available) ──
+tmux display-menu -T "Worktrees" "${menu_args[@]}"

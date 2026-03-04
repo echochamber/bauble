@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# tmux-claim-bead: claim a bead and rename the tmux window
+# Part of bauble — ambient session UX for Claude Code
+#
+# Wraps `bd update <id> --status=in_progress` and renames the
+# current tmux window to a truncated version of the bead subject.
+#
+# Usage:
+#   tmux-claim-bead <bead-id>
+#   tmux-claim-bead manapool-0ch
+
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "Usage: tmux-claim-bead <bead-id>"
+  exit 1
+fi
+
+BEAD_ID="$1"
+MAX_LEN=30
+
+# Claim the bead
+bd update "$BEAD_ID" --status=in_progress
+
+# Extract the subject (everything after " - " in bd show output)
+subject=$(bd show "$BEAD_ID" 2>/dev/null | grep -E '^\S+ \[' | head -1 | sed 's/.*- //')
+
+if [ -z "$subject" ]; then
+  tmux display-message "Claimed $BEAD_ID (could not read subject)"
+  exit 0
+fi
+
+# Truncate subject for window title
+short_id=$(echo "$BEAD_ID" | sed 's/^manapool-//')
+if [ ${#subject} -gt $MAX_LEN ]; then
+  subject="${subject:0:$MAX_LEN}…"
+fi
+title="${short_id}: ${subject}"
+
+# Rename current tmux window
+if [ -n "${TMUX:-}" ]; then
+  tmux rename-window "$title"
+fi
+
+echo "Claimed $BEAD_ID → $title"

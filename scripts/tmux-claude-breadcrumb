@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# tmux-claude-breadcrumb: show recent origin points and navigate back
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to prefix+End. Reads breadcrumbs recorded by tmux-claude-next,
+# shows the last 10 live entries in a display-menu with relative timestamps.
+
+set -euo pipefail
+
+BREADCRUMBS="$HOME/.claude/hooks/bauble-breadcrumbs.json"
+SELF="$HOME/.claude/scripts/tmux-claude-breadcrumb"
+
+# --goto handler: navigate to a specific pane (called from menu entries)
+if [[ "${1:-}" == "--goto" ]]; then
+  pane_id="${2:-}"
+  target_session="${3:-}"
+  current_session=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+  [ "$target_session" != "$current_session" ] && tmux switch-client -t "$target_session" 2>/dev/null
+  tmux select-window -t "$pane_id" 2>/dev/null
+  tmux select-pane -t "$pane_id" 2>/dev/null
+  # Clear cycle flag so future departures from here record a breadcrumb
+  tmux set-option -p -t "$pane_id" -qu @bauble-nav-via-cycle 2>/dev/null
+  exit 0
+fi
+
+# Read breadcrumbs and build menu entries
+if [ ! -f "$BREADCRUMBS" ]; then
+  tmux display-message "No breadcrumbs"
+  exit 0
+fi
+
+# Get live panes, filter breadcrumbs, format for menu
+menu_data=$(BREADCRUMBS="$BREADCRUMBS" python3 -c "
+import json, time, os
+
+path = os.environ['BREADCRUMBS']
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (OSError, json.JSONDecodeError):
+    data = []
+
+if not data:
+    exit(1)
+
+# Take last 10
+entries = data[-10:]
+
+# Get set of live pane IDs
+import subprocess
+result = subprocess.run(
+    ['tmux', 'list-panes', '-a', '-F', '#{pane_id}'],
+    capture_output=True, text=True
+)
+live_panes = set(result.stdout.strip().split('\n')) if result.stdout.strip() else set()
+
+now = time.time()
+lines = []
+for entry in reversed(entries):
+    pane_id = entry.get('pane_id', '')
+    if pane_id not in live_panes:
+        continue
+
+    session = entry.get('session', '?')
+    window_name = entry.get('window_name', '?')
+    ts = entry.get('timestamp', 0)
+
+    # Relative time
+    delta = int(now - ts)
+    if delta < 60:
+        rel = f'{delta}s ago'
+    elif delta < 3600:
+        rel = f'{delta // 60}m ago'
+    elif delta < 86400:
+        rel = f'{delta // 3600}h ago'
+    else:
+        rel = f'{delta // 86400}d ago'
+
+    label = f'{rel}  {window_name} [{session}]'
+    lines.append(f'{label}\t{pane_id}\t{session}')
+
+if not lines:
+    exit(1)
+
+for line in lines:
+    print(line)
+" 2>/dev/null)
+
+if [ -z "$menu_data" ]; then
+  tmux display-message "No breadcrumbs"
+  exit 0
+fi
+
+# Escape single quotes for tmux run-shell arguments
+sq() { local s="$1"; echo "${s//\'/\'\\\'\'}"; }
+
+# Build display-menu args
+args=()
+while IFS=$'\t' read -r label pane_id session; do
+  [ -z "$label" ] && continue
+  args+=("$label" "" "run-shell -b '$(sq "$SELF") --goto $(sq "$pane_id") $(sq "$session")'")
+done <<< "$menu_data"
+
+if [ ${#args[@]} -eq 0 ]; then
+  tmux display-message "No breadcrumbs"
+  exit 0
+fi
+
+tmux display-menu -T "Go Back" -- "${args[@]}"

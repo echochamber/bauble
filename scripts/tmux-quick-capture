@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# tmux-quick-capture: gum-powered quick capture popup
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to tmux prefix+g, c. Opens a gum popup to capture a thought
+# and route it to the right place: note, bead, or Linear task.
+#
+# Requires: gum (https://github.com/charmbracelet/gum)
+
+set -euo pipefail
+
+# Ensure PATH includes common tool locations (popup shells may not source profile)
+for p in "$HOME/.claude/scripts" "$HOME/Code/Chaimber/TheLab/linear-sync/bin" /opt/homebrew/bin; do
+  [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && PATH="$p:$PATH"
+done
+
+# Load config — resolve through symlinks to find config dir
+_QC_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$_QC_SOURCE" ]; do
+  _QC_DIR="$(cd "$(dirname "$_QC_SOURCE")" && pwd)"
+  _QC_SOURCE="$(readlink "$_QC_SOURCE")"
+  [[ "$_QC_SOURCE" != /* ]] && _QC_SOURCE="$_QC_DIR/$_QC_SOURCE"
+done
+_QC_SCRIPT_DIR="$(cd "$(dirname "$_QC_SOURCE")" && pwd)"
+_QC_CONF="$(dirname "$_QC_SCRIPT_DIR")/config/bauble.conf"
+[ -f "$_QC_CONF" ] && source "$_QC_CONF"
+BAUBLE_QUICK_DIR="${BAUBLE_QUICK_DIR:-$HOME/notes/quick}"
+
+NOTES_DIR="$BAUBLE_QUICK_DIR"
+mkdir -p "$NOTES_DIR"
+
+# Try Textual UI first (already inside a tmux popup from keybinding)
+if command -v bauble-ui &>/dev/null; then
+  exec bauble-ui capture
+fi
+
+# Header
+gum style --border rounded --border-foreground 99 --padding "0 2" \
+  --foreground 99 --bold "Quick Capture"
+
+echo ""
+
+# Choose destination
+DEST=$(gum choose --cursor.foreground 99 --selected.foreground 99 \
+  "Note  → ${BAUBLE_QUICK_DIR/#$HOME/\~}/" \
+  "Bead  → bd create (engineering task)" \
+  "Linear → personal task queue") || exit 0
+
+# Extract just the keyword
+DEST_KEY="${DEST%%  *}"
+
+case "$DEST_KEY" in
+  Note)
+    TITLE=$(gum input --placeholder "Title (optional — Enter to skip)" \
+      --prompt "  " --prompt.foreground 99 --width 60) || exit 0
+
+    BODY=$(gum write --placeholder "Write your note... (Ctrl+D to save, Esc to cancel)" \
+      --prompt "  " --width 60 --height 8 --char-limit 4000) || exit 0
+
+    if [[ -z "$TITLE" && -z "$BODY" ]]; then
+      gum style --foreground 241 "  Nothing to save."
+      sleep 1
+      exit 0
+    fi
+
+    TS=$(date +"%Y-%m-%d-%H%M")
+    if [[ -n "$TITLE" ]]; then
+      SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')
+      FILENAME="${TS}-${SLUG}.md"
+    else
+      FILENAME="${TS}-note.md"
+    fi
+
+    {
+      if [[ -n "$TITLE" ]]; then
+        echo "# $TITLE"
+        echo ""
+      fi
+      echo "$BODY"
+    } > "$NOTES_DIR/$FILENAME"
+
+    echo ""
+    gum style --foreground 78 "  Saved → ${BAUBLE_QUICK_DIR/#$HOME/\~}/$FILENAME"
+    sleep 1.5
+    ;;
+
+  Bead)
+    # Check for beads-enabled repo before collecting input
+    if ! bd list --status=open &>/dev/null; then
+      gum style --foreground 196 "  No beads repo found in current directory."
+      gum style --foreground 241 "  cd to a repo with .beads/ first."
+      sleep 2
+      exit 0
+    fi
+
+    TITLE=$(gum input --placeholder "Issue title" \
+      --prompt "  " --prompt.foreground 214 --width 60) || exit 0
+
+    [[ -z "$TITLE" ]] && { gum style --foreground 241 "  No title."; sleep 1; exit 0; }
+
+    TYPE=$(gum choose --cursor.foreground 214 --selected.foreground 214 \
+      "task" "bug" "feature") || exit 0
+
+    PRIORITY=$(gum choose --cursor.foreground 214 --selected.foreground 214 \
+      "P2 (medium)" "P1 (high)" "P3 (low)" "P0 (critical)" "P4 (backlog)") || exit 0
+    # Extract just the number
+    PRIORITY_NUM="${PRIORITY:1:1}"
+
+    DESC=$(gum write --placeholder "Description (optional — Ctrl+D to save, Esc to skip)" \
+      --prompt "  " --width 60 --height 5 --char-limit 2000) || DESC=""
+
+    echo ""
+    BD_ARGS=(--title="$TITLE" --type="$TYPE" --priority="$PRIORITY_NUM")
+    [[ -n "$DESC" ]] && BD_ARGS+=(--description="$DESC")
+
+    if BD_OUTPUT=$(bd create "${BD_ARGS[@]}" 2>&1); then
+      echo ""
+      # Try to extract the bead ID from bd output
+      BEAD_ID=$(echo "$BD_OUTPUT" | grep -oE '[A-Za-z]+-[a-z0-9]+' | head -1) || BEAD_ID=""
+      if [[ -n "$BEAD_ID" ]]; then
+        gum style --foreground 214 "  Created bead $BEAD_ID: $TITLE"
+      else
+        gum style --foreground 214 "  Created bead: $TITLE"
+      fi
+    else
+      echo ""
+      gum style --foreground 196 "  Failed to create bead:"
+      gum style --foreground 241 "  $BD_OUTPUT"
+      sleep 3
+      exit 1
+    fi
+    sleep 1.5
+    ;;
+
+  Linear)
+    TITLE=$(gum input --placeholder "Task description" \
+      --prompt "  " --prompt.foreground 135 --width 60) || exit 0
+
+    [[ -z "$TITLE" ]] && { gum style --foreground 241 "  No title."; sleep 1; exit 0; }
+
+    echo ""
+    if ! command -v linear-add &>/dev/null; then
+      gum style --foreground 196 "  linear-add not found on PATH."
+      gum style --foreground 241 "  Install linear-sync or check PATH."
+      sleep 2
+      exit 1
+    fi
+
+    if gum spin --spinner dot --title "Adding to Linear..." -- \
+      linear-add "$TITLE"; then
+      echo ""
+      gum style --foreground 135 "  Added to Linear backlog"
+    else
+      echo ""
+      gum style --foreground 196 "  Failed to add to Linear."
+      gum style --foreground 241 "  Check linear-add configuration."
+      sleep 2
+      exit 1
+    fi
+    sleep 1.5
+    ;;
+esac

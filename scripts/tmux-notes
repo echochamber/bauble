@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# tmux-notes: browse saved notes by session
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to tmux prefix+n. Shows notes saved from the current Claude
+# session, plus the 5 most recent from other sessions. Select to
+# open in a glow split.
+#
+# Modes:
+#   (default)  Scan notes → launch popup with gum filter, or fall back to display-menu
+#   --popup    Runs inside the tmux popup: present list → gum filter → open
+#   --open     Open a note in glow viewer split (called from selection handler)
+
+set -euo pipefail
+
+# Resolve through symlinks
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+VIEWER="$SCRIPT_DIR/tmux-glow-viewer"
+
+SELF="$HOME/.claude/scripts/tmux-notes"
+BAUBLE_TMP="/tmp/bauble-${UID}"
+mkdir -p -m 700 "$BAUBLE_TMP" 2>/dev/null
+
+# Load config
+CONF="$(dirname "$SCRIPT_DIR")/config/bauble.conf"
+[ -f "$CONF" ] && source "$CONF"
+BAUBLE_NOTES_DIR="${BAUBLE_NOTES_DIR:-$HOME/notes}"
+BAUBLE_SPLIT_WIDTH="${BAUBLE_SPLIT_WIDTH:-100}"
+
+# Escape single quotes for tmux split-window arguments
+sq() { local s="$1"; echo "${s//\'/\'\\\'\'}"; }
+
+# Try Textual UI first (before any tmux pane queries that fail outside tmux)
+if [[ "${1:-}" != "--open" ]] && [[ "${1:-}" != "--popup" ]]; then
+  if command -v bauble-ui &>/dev/null; then
+    tmux display-popup -w 80 -h 22 -E "bauble-ui notes"
+    exit 0
+  fi
+fi
+
+# Compute adaptive split: horizontal if viewer takes <50% of pane width, else vertical
+_PANE_W=$(tmux display-message -p '#{pane_width}')
+_SPLIT_W="$BAUBLE_SPLIT_WIDTH"
+if [ $((_PANE_W / 2)) -gt "$_SPLIT_W" ]; then
+  SPLIT="split-window -h -l $_SPLIT_W"
+else
+  SPLIT="split-window -v -l 60%"
+fi
+
+# ── --open handler: open note in glow viewer split ──
+if [[ "${1:-}" == "--open" ]]; then
+  filepath="${2:-}"
+  if [ -n "$filepath" ] && [ -f "$filepath" ]; then
+    tmux $SPLIT "'$(sq "$VIEWER")' '$(sq "$filepath")'"
+  fi
+  exit 0
+fi
+
+NOTES_DIR="$BAUBLE_NOTES_DIR"
+
+if [ ! -d "$NOTES_DIR" ]; then
+  tmux display-message "No $NOTES_DIR directory"
+  exit 0
+fi
+
+# Find current session ID
+CURRENT_SESSION=""
+PANE_CWD=$(tmux display-message -p '#{pane_current_path}' 2>/dev/null)
+GIT_ROOT=$(cd "$PANE_CWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)
+if [ -n "$GIT_ROOT" ]; then
+  PROJECT_DIR="$HOME/.claude/projects/-$(echo "$GIT_ROOT" | sed 's|^/||; s|/|-|g')"
+  if [ -d "$PROJECT_DIR" ]; then
+    LATEST=$(ls -t "$PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
+    [ -n "$LATEST" ] && CURRENT_SESSION="$(basename "$LATEST" .jsonl)"
+  fi
+fi
+
+# Scan notes for session metadata
+# Builds two lists: current session files and other session files (by recency)
+current_files=()
+other_files=()
+
+for f in $(ls -t "$NOTES_DIR"/* 2>/dev/null); do
+  [ -f "$f" ] || continue
+  # Read session ID from frontmatter (first 5 lines)
+  file_session=$(head -5 "$f" | grep '^claude_session:' | sed 's/^claude_session: *//' | tr -d '[:space:]')
+
+  if [ -n "$CURRENT_SESSION" ] && [ "$file_session" = "$CURRENT_SESSION" ]; then
+    current_files+=("$f")
+  else
+    other_files+=("$f")
+  fi
+done
+
+if [ ${#current_files[@]} -eq 0 ] && [ ${#other_files[@]} -eq 0 ]; then
+  tmux display-message "No notes found in $NOTES_DIR"
+  exit 0
+fi
+
+# ── Default mode: launch popup or fall back to display-menu ──
+if [[ "${1:-}" != "--popup" ]]; then
+  if command -v gum &>/dev/null; then
+    # Write file lists to temp files so the popup can read them
+    tmplist=$(mktemp "$BAUBLE_TMP"/notes-XXXXXX)
+    # Format: group_tag<TAB>filepath<TAB>label
+    for f in "${current_files[@]}"; do
+      name=$(basename "$f")
+      src=$(head -5 "$f" | grep '^source:' | sed 's/^source: *//')
+      label="$name"
+      [ -n "$src" ] && label="$name ← $(basename "$src")"
+      printf 'session\t%s\t%s\n' "$f" "$label"
+    done > "$tmplist"
+    count=0
+    for f in "${other_files[@]}"; do
+      [ $count -ge 5 ] && break
+      name=$(basename "$f")
+      src=$(head -5 "$f" | grep '^source:' | sed 's/^source: *//')
+      label="$name"
+      [ -n "$src" ] && label="$name ← $(basename "$src")"
+      printf 'recent\t%s\t%s\n' "$f" "$label"
+      count=$((count + 1))
+    done >> "$tmplist"
+
+    tmux display-popup -w 80 -h 22 -E "bash -l '${SELF}' --popup '$tmplist'"
+    rm -f "$tmplist" 2>/dev/null
+    exit 0
+  fi
+  # Fall through to display-menu below
+fi
+
+# ── --popup mode: gum filter inside the tmux popup ──
+if [[ "${1:-}" == "--popup" ]]; then
+  tmplist="${2:-}"
+
+  # Ensure PATH includes common tool locations
+  for p in /opt/homebrew/bin /usr/local/bin "$HOME/.claude/scripts"; do
+    [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && PATH="$p:$PATH"
+  done
+
+  if [ -z "$tmplist" ] || [ ! -f "$tmplist" ]; then
+    echo "No notes to display."
+    sleep 1
+    exit 0
+  fi
+
+  DELIM="┊"
+  display_lines=()
+  while IFS=$'\t' read -r group filepath label; do
+    [ -z "$filepath" ] && continue
+    tag=""
+    [ "$group" = "session" ] && tag="[this session] "
+    [ "$group" = "recent" ] && tag="[recent] "
+    display_lines+=("${tag}${label} ${DELIM}${filepath}")
+  done < "$tmplist"
+  rm -f "$tmplist" 2>/dev/null
+
+  if [ ${#display_lines[@]} -eq 0 ]; then
+    echo "No notes found."
+    sleep 1
+    exit 0
+  fi
+
+  selected=$(printf '%s\n' "${display_lines[@]}" | gum filter \
+    --fuzzy \
+    --header "Saved Notes  (type to filter)" \
+    --header.foreground 99 \
+    --placeholder "Filter..." \
+    --prompt "> " \
+    --prompt.foreground 99 \
+    --indicator.foreground 99 \
+    --select-if-one \
+    --strict \
+    --height 18 \
+    --width 0) || exit 0
+
+  # Extract filepath from delimiter-separated suffix
+  filepath="${selected##*${DELIM}}"
+
+  if [ -n "$filepath" ]; then
+    exec "$SELF" --open "$filepath"
+  fi
+  exit 0
+fi
+
+# ── Display-menu fallback (no gum available) ──
+args=()
+
+if [ ${#current_files[@]} -gt 0 ]; then
+  args+=("This session" "" "")
+  for f in "${current_files[@]}"; do
+    name=$(basename "$f")
+    # Get source from frontmatter
+    src=$(head -5 "$f" | grep '^source:' | sed 's/^source: *//')
+    label="$name"
+    [ -n "$src" ] && label="$name ← $(basename "$src")"
+    args+=("  $label" "" "$SPLIT \"'$(sq "$VIEWER")' '$(sq "$f")'\"")
+  done
+  args+=("" "" "")
+fi
+
+if [ ${#other_files[@]} -gt 0 ]; then
+  args+=("Recent (other sessions)" "" "")
+  count=0
+  for f in "${other_files[@]}"; do
+    [ $count -ge 5 ] && break
+    name=$(basename "$f")
+    src=$(head -5 "$f" | grep '^source:' | sed 's/^source: *//')
+    label="$name"
+    [ -n "$src" ] && label="$name ← $(basename "$src")"
+    args+=("  $label" "" "$SPLIT \"'$(sq "$VIEWER")' '$(sq "$f")'\"")
+    count=$((count + 1))
+  done
+fi
+
+if [ ${#args[@]} -eq 0 ]; then
+  tmux display-message "No notes found in $NOTES_DIR"
+  exit 0
+fi
+
+tmux display-menu -T "Saved Notes" "${args[@]}"

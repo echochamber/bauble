@@ -1,0 +1,76 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/pane-tint.sh working"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/pane-tint.sh working"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/pane-tint.sh working"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/pane-tint.sh done"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/scripts/bauble-play-sound done"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/pane-tint.sh waiting"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/waiting-context.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/scripts/bauble-play-sound waiting"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/pane-cleanup.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

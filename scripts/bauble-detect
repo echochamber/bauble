@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# bauble-detect — Polling-based state detector for non-Claude AI tools
+# Part of bauble — ambient session UX for AI coding agents
+#
+# For AI tools that lack hook systems (Gemini, Aider, Codex), this script
+# polls tmux capture-pane and sets pane state via pane-tint.sh.
+#
+# Usage:
+#   bauble-detect <pane-id> <tool>     Start detecting (foreground)
+#   bauble-detect <pane-id> <tool> -d  Start detecting (daemon, backgrounds itself)
+#   bauble-detect --auto                Auto-detect AI tools in all panes
+#   bauble-detect --stop <pane-id>     Stop detecting for a pane
+#   bauble-detect --status             Show active detectors
+#
+# Examples:
+#   bauble-detect %42 gemini            Watch pane %42 for Gemini CLI state
+#   bauble-detect %42 gemini -d         Same, but fork to background and return
+#   bauble-detect --auto                Scan all panes, start detectors for any found
+#
+# Polling interval is configurable via BAUBLE_DETECT_INTERVAL (default: 1s).
+
+set -euo pipefail
+
+# ── Resolve paths ──
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" != /* ]] && SELF="$DIR/$SELF"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+BAUBLE_DIR="$(dirname "$SCRIPT_DIR")"
+DETECTORS_DIR="$BAUBLE_DIR/detectors"
+PANE_TINT="$BAUBLE_DIR/hooks/pane-tint.sh"
+
+# Source config
+CONF="$BAUBLE_DIR/config/bauble.conf"
+[ -f "$CONF" ] && source "$CONF"
+
+INTERVAL="${BAUBLE_DETECT_INTERVAL:-1}"
+CAPTURE_LINES="${BAUBLE_DETECT_LINES:-15}"
+BAUBLE_TMP="/tmp/bauble-${UID}"
+mkdir -p -m 700 "$BAUBLE_TMP" 2>/dev/null
+PID_DIR="$BAUBLE_TMP/detect"
+LOG_FILE="$BAUBLE_TMP/detect.log"
+
+mkdir -p "$PID_DIR"
+
+# ── Logging ──
+log() {
+  printf '%s [bauble-detect] %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$*" >> "$LOG_FILE"
+}
+
+# ── Load detector ──
+load_detector() {
+  local tool="$1"
+  local detector_script="$DETECTORS_DIR/${tool}.sh"
+
+  if [ ! -f "$detector_script" ]; then
+    echo "Error: no detector found for '$tool' (expected $detector_script)" >&2
+    exit 1
+  fi
+
+  source "$detector_script"
+}
+
+# ── Map detector state → pane-tint state ──
+# Detectors emit: idle, working, waiting, unknown
+# pane-tint.sh expects: working, waiting, done
+map_state() {
+  local detected="$1"
+  case "$detected" in
+    idle)    echo "done" ;;
+    working) echo "working" ;;
+    waiting) echo "waiting" ;;
+    *)       echo "" ;;  # unknown → don't change
+  esac
+}
+
+# ── Display name for window auto-rename ──
+get_display_name() {
+  local tool="$1"
+  local conf_file="$DETECTORS_DIR/detector.conf"
+
+  if [ -f "$conf_file" ]; then
+    while IFS=: read -r proc detector name; do
+      [[ "$proc" =~ ^#.*$ || -z "$proc" ]] && continue
+      if [ "$proc" = "$tool" ] || [ "$detector" = "${tool}.sh" ]; then
+        echo "$name"
+        return
+      fi
+    done < "$conf_file"
+  fi
+  echo "$tool"
+}
+
+# ── Auto-rename window ──
+auto_rename_window() {
+  local pane="$1"
+  local tool="$2"
+
+  [ "${BAUBLE_AUTO_RENAME:-1}" = "0" ] && return
+
+  local window
+  window=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null) || return
+  local current_name
+  current_name=$(tmux display-message -p -t "$window" '#{window_name}' 2>/dev/null) || return
+
+  local display_name
+  display_name=$(get_display_name "$tool")
+
+  case "$current_name" in
+    zsh|bash|fish|sh|[0-9]*|node)
+      tmux rename-window -t "$window" "$display_name" 2>/dev/null
+      ;;
+  esac
+}
+
+# ── Core: poll a single pane ──
+poll_pane() {
+  local pane="$1"
+  local tool="$2"
+  local detect_fn="detect_${tool}_state"
+
+  # Write PID file for tracking
+  echo $$ > "$PID_DIR/$pane.pid"
+  echo "$tool" > "$PID_DIR/$pane.tool"
+
+  log "started: pane=$pane tool=$tool pid=$$ interval=${INTERVAL}s"
+
+  # Auto-rename the window on first attach
+  auto_rename_window "$pane" "$tool"
+
+  local prev_state=""
+
+  trap 'log "stopped: pane=$pane tool=$tool pid=$$"; rm -f "$PID_DIR/$pane.pid" "$PID_DIR/$pane.tool"; exit 0' EXIT INT TERM
+
+  while true; do
+    # Verify pane still exists
+    if ! tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
+      log "pane $pane gone, exiting"
+      break
+    fi
+
+    # Capture last N lines
+    local content
+    content=$(tmux capture-pane -t "$pane" -p -S -"$CAPTURE_LINES" 2>/dev/null) || continue
+
+    # Run detector
+    local detected
+    detected=$("$detect_fn" "$content")
+
+    # Map to pane-tint state
+    local tint_state
+    tint_state=$(map_state "$detected")
+
+    # Only update on state change (and only for known states)
+    if [ -n "$tint_state" ] && [ "$tint_state" != "$prev_state" ]; then
+      log "state change: pane=$pane $prev_state → $tint_state (detected=$detected)"
+
+      # Set TMUX_PANE so pane-tint.sh targets the right pane
+      TMUX_PANE="$pane" bash "$PANE_TINT" "$tint_state"
+      prev_state="$tint_state"
+    fi
+
+    sleep "$INTERVAL"
+  done
+}
+
+# ── Auto-detect: scan all panes for known AI tools ──
+auto_detect() {
+  log "auto-detect scan starting"
+
+  local conf_file="$DETECTORS_DIR/detector.conf"
+  if [ ! -f "$conf_file" ]; then
+    echo "Error: no detector.conf found at $conf_file" >&2
+    exit 1
+  fi
+
+  # Build list of process names to look for
+  declare -A tool_map
+  while IFS=: read -r proc detector name; do
+    [[ "$proc" =~ ^#.*$ || -z "$proc" ]] && continue
+    tool_map["$proc"]="${detector%.sh}"
+  done < "$conf_file"
+
+  for pane in $(tmux list-panes -a -F '#{pane_id}' 2>/dev/null); do
+    # Skip panes already being detected
+    [ -f "$PID_DIR/$pane.pid" ] && kill -0 "$(cat "$PID_DIR/$pane.pid")" 2>/dev/null && continue
+
+    # Skip panes with Claude Code (they use hooks, not polling)
+    local bauble_state
+    bauble_state=$(tmux show-option -p -t "$pane" -qv @bauble-state 2>/dev/null)
+    [ -n "$bauble_state" ] && continue
+
+    # Get the foreground process of the pane
+    local pane_pid
+    pane_pid=$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null) || continue
+
+    # Check child processes for known AI tools
+    local children
+    children=$(ps -o comm= -p "$pane_pid" 2>/dev/null; pgrep -P "$pane_pid" 2>/dev/null | xargs -I{} ps -o comm= -p {} 2>/dev/null) || continue
+
+    for proc_name in "${!tool_map[@]}"; do
+      if printf '%s\n' "$children" | grep -q "$proc_name"; then
+        local tool="${tool_map[$proc_name]}"
+        log "auto-detected $proc_name in pane $pane, starting $tool detector"
+        load_detector "$tool"
+        poll_pane "$pane" "$tool" &
+      fi
+    done
+  done
+
+  log "auto-detect scan complete"
+}
+
+# ── Stop detector for a pane ──
+stop_detector() {
+  local pane="$1"
+  local pid_file="$PID_DIR/$pane.pid"
+
+  if [ -f "$pid_file" ]; then
+    local pid
+    pid=$(cat "$pid_file")
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      echo "Stopped detector for pane $pane (pid $pid)"
+    else
+      echo "Detector for pane $pane already stopped (stale pid)"
+      rm -f "$pid_file" "$PID_DIR/$pane.tool"
+    fi
+  else
+    echo "No detector running for pane $pane"
+  fi
+}
+
+# ── Show status ──
+show_status() {
+  local found=0
+  for pid_file in "$PID_DIR"/*.pid; do
+    [ -f "$pid_file" ] || continue
+    local pane
+    pane=$(basename "$pid_file" .pid)
+    local pid
+    pid=$(cat "$pid_file")
+    local tool="?"
+    [ -f "$PID_DIR/$pane.tool" ] && tool=$(cat "$PID_DIR/$pane.tool")
+
+    if kill -0 "$pid" 2>/dev/null; then
+      local state
+      state=$(tmux show-option -p -t "$pane" -qv @bauble-state 2>/dev/null || echo "?")
+      printf '  %s  %-10s  pid=%-6s  state=%s\n' "$pane" "$tool" "$pid" "$state"
+      found=1
+    else
+      rm -f "$pid_file" "$PID_DIR/$pane.tool"
+    fi
+  done
+
+  if [ "$found" -eq 0 ]; then
+    echo "  No active detectors"
+  fi
+}
+
+# ── Main ──
+case "${1:-}" in
+  --auto)
+    auto_detect
+    ;;
+  --stop)
+    [ -z "${2:-}" ] && { echo "Usage: bauble-detect --stop <pane-id>"; exit 1; }
+    stop_detector "$2"
+    ;;
+  --status)
+    echo "Active bauble detectors:"
+    show_status
+    ;;
+  --help|-h|"")
+    cat <<'EOF'
+Usage:
+  bauble-detect <pane-id> <tool>      Start polling detector (foreground)
+  bauble-detect <pane-id> <tool> -d   Start polling detector (daemon)
+  bauble-detect --auto                Auto-detect AI tools in all panes
+  bauble-detect --stop <pane-id>      Stop detecting for a pane
+  bauble-detect --status              Show active detectors
+  bauble-detect --help                Show this help
+
+Supported tools:
+EOF
+    if [ -f "$DETECTORS_DIR/detector.conf" ]; then
+      while IFS=: read -r proc detector name; do
+        [[ "$proc" =~ ^#.*$ || -z "$proc" ]] && continue
+        printf '  %-12s %s\n' "$proc" "(detector: $detector)"
+      done < "$DETECTORS_DIR/detector.conf"
+    fi
+    ;;
+  %*|@*)
+    # Pane ID provided — start detector
+    pane="$1"
+    tool="${2:-}"
+    [ -z "$tool" ] && { echo "Usage: bauble-detect <pane-id> <tool>"; exit 1; }
+    daemon=0
+    [[ "${3:-}" == "-d" || "${3:-}" == "--daemon" ]] && daemon=1
+
+    if [ "$daemon" -eq 1 ]; then
+      # Re-exec ourselves in background without -d, fully detached
+      "$0" "$pane" "$tool" </dev/null >>"$LOG_FILE" 2>&1 &
+      disown $!
+      echo "Started detector for $pane ($tool) as pid $!"
+      exit 0
+    fi
+
+    load_detector "$tool"
+    poll_pane "$pane" "$tool"
+    ;;
+  *)
+    echo "Unknown option: $1 (try --help)" >&2
+    exit 1
+    ;;
+esac

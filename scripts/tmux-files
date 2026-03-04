@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# tmux-files: scan current pane for file:// URLs, open selection in pager split
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to tmux prefix+g, f. Scans the pane scrollback for file:// URLs,
+# validates they exist on disk, and opens them in a pager side pane.
+# Uses bat (if available) or less as the viewer.
+#
+# Modes:
+#   (default)  Scan pane → launch popup with gum filter, or fall back to display-menu
+#   --popup    Runs inside the tmux popup: present list → gum filter → open
+#   --open     Open a file in a viewer split (called from selection handler)
+
+set -euo pipefail
+
+# Resolve through symlinks to find the actual script directory
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+VIEWER="$SCRIPT_DIR/tmux-files-viewer"
+
+SELF="$HOME/.claude/scripts/tmux-files"
+BAUBLE_TMP="/tmp/bauble-${UID}"
+mkdir -p -m 700 "$BAUBLE_TMP" 2>/dev/null
+
+# Load config
+CONF="$(dirname "$SCRIPT_DIR")/config/bauble.conf"
+[ -f "$CONF" ] && source "$CONF"
+BAUBLE_MAX_MENU_ITEMS="${BAUBLE_MAX_MENU_ITEMS:-8}"
+BAUBLE_SCROLLBACK_LINES="${BAUBLE_SCROLLBACK_LINES:--}"
+BAUBLE_SPLIT_WIDTH="${BAUBLE_SPLIT_WIDTH:-100}"
+
+# Escape single quotes for tmux split-window arguments
+sq() { local s="$1"; echo "${s//\'/\'\\\'\'}"; }
+
+# Compute adaptive split: horizontal if viewer takes <50% of pane width, else vertical
+_PANE_W=$(tmux display-message -p '#{pane_width}')
+_SPLIT_W="$BAUBLE_SPLIT_WIDTH"
+if [ $((_PANE_W / 2)) -gt "$_SPLIT_W" ]; then
+  SPLIT="split-window -h -l $_SPLIT_W"
+else
+  SPLIT="split-window -v -l 60%"
+fi
+
+# ── --open handler: open file in viewer split ──
+if [[ "${1:-}" == "--open" ]]; then
+  filepath="${2:-}"
+  if [ -n "$filepath" ] && [ -f "$filepath" ]; then
+    tmux $SPLIT "'$(sq "$VIEWER")' '$(sq "$filepath")'"
+  fi
+  exit 0
+fi
+
+# Build capture-pane args: "-" means full scrollback, otherwise -N lines
+if [ "$BAUBLE_SCROLLBACK_LINES" = "-" ]; then
+  CAPTURE_START="-"
+else
+  CAPTURE_START="-${BAUBLE_SCROLLBACK_LINES}"
+fi
+
+# Capture scrollback and extract file:// URLs
+# Strips the file:// prefix, deduplicates (most recent first)
+paths=$(
+  tmux capture-pane -p -S "$CAPTURE_START" \
+  | grep -oE 'file:///[^ "'\''`]+' \
+  | sed 's|^file://||' \
+  | tac \
+  | awk '!seen[$0]++' \
+  | head -n "$BAUBLE_MAX_MENU_ITEMS"
+)
+
+# Filter to files that actually exist
+existing=()
+while IFS= read -r p; do
+  [ -n "$p" ] && [ -f "$p" ] && existing+=("$p")
+done <<< "$paths"
+
+if [ ${#existing[@]} -eq 0 ]; then
+  tmux display-message "No file:// URLs found in pane"
+  exit 0
+fi
+
+if [ ${#existing[@]} -eq 1 ]; then
+  tmux $SPLIT "'$(sq "$VIEWER")' '$(sq "${existing[0]}")'"
+  exit 0
+fi
+
+# ── Default mode: launch popup or fall back to display-menu ──
+if [[ "${1:-}" != "--popup" ]]; then
+  # Try Textual UI first (fastest, best UX)
+  if command -v bauble-ui &>/dev/null; then
+    tmux display-popup -w 80 -h 18 -E "bauble-ui files"
+    exit 0
+  fi
+  if command -v gum &>/dev/null; then
+    # Write file list to a temp file so the popup can read it
+    # (popup shell can't access our variables)
+    tmplist=$(mktemp "$BAUBLE_TMP"/files-XXXXXX)
+    printf '%s\n' "${existing[@]}" > "$tmplist"
+    tmux display-popup -w 80 -h 18 -E "bash -l '${SELF}' --popup '$tmplist'"
+    rm -f "$tmplist" 2>/dev/null
+    exit 0
+  fi
+  # Fall through to display-menu below
+fi
+
+# ── --popup mode: gum filter inside the tmux popup ──
+if [[ "${1:-}" == "--popup" ]]; then
+  tmplist="${2:-}"
+
+  # Ensure PATH includes common tool locations
+  for p in /opt/homebrew/bin /usr/local/bin "$HOME/.claude/scripts"; do
+    [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && PATH="$p:$PATH"
+  done
+
+  if [ -z "$tmplist" ] || [ ! -f "$tmplist" ]; then
+    echo "No files to display."
+    sleep 1
+    exit 0
+  fi
+
+  DELIM="┊"
+  display_lines=()
+  while IFS= read -r filepath; do
+    [ -z "$filepath" ] && continue
+    name=$(basename "$filepath")
+    dir=$(basename "$(dirname "$filepath")")
+    display_lines+=("${dir}/${name} ${DELIM}${filepath}")
+  done < "$tmplist"
+  rm -f "$tmplist" 2>/dev/null
+
+  if [ ${#display_lines[@]} -eq 0 ]; then
+    echo "No files found."
+    sleep 1
+    exit 0
+  fi
+
+  selected=$(printf '%s\n' "${display_lines[@]}" | gum filter \
+    --fuzzy \
+    --header "Open file  (type to filter)" \
+    --header.foreground 99 \
+    --placeholder "Filter..." \
+    --prompt "> " \
+    --prompt.foreground 99 \
+    --indicator.foreground 99 \
+    --select-if-one \
+    --strict \
+    --height 15 \
+    --width 0) || exit 0
+
+  # Extract filepath from delimiter-separated suffix
+  filepath="${selected##*${DELIM}}"
+
+  if [ -n "$filepath" ]; then
+    exec "$SELF" --open "$filepath"
+  fi
+  exit 0
+fi
+
+# ── Display-menu fallback (no gum available) ──
+args=()
+for p in "${existing[@]}"; do
+  name=$(basename "$p")
+  dir=$(basename "$(dirname "$p")")
+  args+=("$dir/$name" "" "$SPLIT \"'$(sq "$VIEWER")' '$(sq "$p")'\"")
+done
+tmux display-menu -T "Open file" "${args[@]}"

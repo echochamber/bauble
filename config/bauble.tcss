@@ -1,0 +1,99 @@
+/* Bauble Textual CSS theme
+ *
+ * Colors here match bauble.conf defaults. The app loads actual values
+ * from config at runtime — this file provides the base styling.
+ */
+
+Screen {
+    background: $surface;
+}
+
+/* FilterableList (Phase 1) */
+.filterable-list {
+    height: 1fr;
+}
+
+.filterable-list .filter-input {
+    dock: top;
+    height: 3;
+    padding: 0 1;
+    border: tall $accent;
+}
+
+.filterable-list .list-view {
+    height: 1fr;
+}
+
+.filterable-list .section-header {
+    color: $text-muted;
+    text-style: bold;
+    padding: 0 1;
+}
+
+.filterable-list .list-item {
+    padding: 0 1;
+    height: 1;
+}
+
+.filterable-list .list-item:hover {
+    background: $boost;
+}
+
+.filterable-list .list-item.--highlight {
+    background: $accent;
+    color: $text;
+}
+
+/* ActionList (Phase 1) */
+.action-list .badge-skip {
+    color: $text-muted;
+}
+
+.action-list .badge-yes {
+    color: $success;
+    text-style: bold;
+}
+
+.action-list .badge-no {
+    color: $error;
+    text-style: bold;
+}
+
+.action-list .badge-goto {
+    color: $accent;
+    text-style: bold;
+}
+
+/* Common popup styling */
+.popup-header {
+    dock: top;
+    height: 3;
+    content-align: center middle;
+    text-style: bold;
+    color: $accent;
+    border-bottom: tall $surface-lighten-2;
+}
+
+.popup-footer {
+    dock: bottom;
+    height: 1;
+    color: $text-muted;
+    content-align: center middle;
+}
+
+/* State color classes — applied dynamically from config */
+.state-working {
+    color: #5b7db8;
+}
+
+.state-waiting {
+    color: #c4a35a;
+}
+
+.state-done {
+    color: #5ab87d;
+}
+
+.state-cancelled {
+    color: #b85a5a;
+}

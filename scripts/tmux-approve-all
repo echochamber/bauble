@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# tmux-approve-all: aggregated approval popup for all waiting Claude panes
+# Part of bauble — ambient session UX for Claude Code
+#
+# Shows each waiting pane with context and per-pane actions:
+#   Skip  — leave untouched (default)
+#   Yes   — send Enter to approve the permission prompt
+#   No    — send Escape to cancel + tint red (cancelled)
+#   GoTo  — navigate to that pane immediately, skip all remaining
+#
+# Escape from the popup = do nothing to any pane.
+#
+# Bound to prefix+g, a. Also usable standalone from any terminal.
+#
+# Logging:
+#   All actions logged to ~/.claude/hooks/bauble-debug.log
+
+set -euo pipefail
+
+SELF="$HOME/.claude/scripts/tmux-approve-all"
+STATE_FILE="$HOME/.claude/hooks/bauble-state.json"
+LOG_FILE="$HOME/.claude/hooks/bauble-debug.log"
+BAUBLE_TMP="/tmp/bauble-${UID}"
+mkdir -p -m 700 "$BAUBLE_TMP" 2>/dev/null
+
+# Structured debug logger
+log() {
+  local level="$1" msg="$2"
+  printf '%s [approve-all] %s: %s\n' \
+    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$level" "$msg" \
+    >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# ── --goto handler ──
+if [[ "${1:-}" == "--goto" ]]; then
+  pane_id="${2:-}"
+  target_session="${3:-}"
+  current_session=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+  [ "$target_session" != "$current_session" ] && tmux switch-client -t "$target_session" 2>/dev/null
+  tmux select-window -t "$pane_id" 2>/dev/null
+  tmux select-pane -t "$pane_id" 2>/dev/null
+  log "INFO" "goto: navigated to pane=${pane_id} session=${target_session}"
+  exit 0
+fi
+
+# ── --popup mode: runs inside the tmux popup ──
+if [[ "${1:-}" == "--popup" ]]; then
+  log "INFO" "popup started"
+
+  # Ensure PATH includes common tool locations
+  for p in /opt/homebrew/bin /usr/local/bin "$HOME/.claude/scripts"; do
+    [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && PATH="$p:$PATH"
+  done
+
+  # Read bauble-state.json for timestamps
+  declare -A pane_timestamps
+  if [ -f "$STATE_FILE" ]; then
+    while IFS=$'\t' read -r pid ts; do
+      [ -n "$pid" ] && pane_timestamps["$pid"]="$ts"
+    done < <(STATE_FILE="$STATE_FILE" python3 -c "
+import json, os
+try:
+    with open(os.environ['STATE_FILE']) as f:
+        data = json.load(f)
+    for pid, info in data.items():
+        if isinstance(info, dict) and 'updated_at' in info:
+            print(f'{pid}\t{info[\"updated_at\"]}')
+except Exception:
+    pass
+" 2>/dev/null)
+  fi
+  NOW=$(python3 -c "import time; print(time.time())" 2>/dev/null)
+
+  format_duration() {
+    local secs="${1%.*}"
+    [ -z "$secs" ] && return
+    if [ "$secs" -lt 60 ]; then echo "<1m"
+    elif [ "$secs" -lt 3600 ]; then echo "$(( secs / 60 ))m"
+    elif [ "$secs" -lt 86400 ]; then
+      local h=$(( secs / 3600 )) m=$(( (secs % 3600) / 60 ))
+      [ "$m" -gt 0 ] && echo "${h}h${m}m" || echo "${h}h"
+    else echo "$(( secs / 86400 ))d"
+    fi
+  }
+
+  # ── Enumerate waiting panes ──
+  pane_data=$(tmux list-panes -a \
+    -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_id}	#{window_name}' \
+    2>/dev/null | sort -t'	' -k1,1 -k2,2n -k3,3n)
+
+  if [ -z "$pane_data" ]; then
+    log "WARN" "no tmux panes found"
+    echo "No tmux panes found."
+    exit 0
+  fi
+
+  # Collect waiting panes with full metadata
+  declare -a pane_ids=()
+  declare -a pane_sessions=()
+  declare -a pane_infos=()
+
+  while IFS=$'\t' read -r session window pane_idx pane_id window_name; do
+    state=$(tmux show-option -p -t "$pane_id" -qv @bauble-state 2>/dev/null)
+    [ "$state" != "waiting" ] && continue
+
+    waiting_tool=$(tmux show-option -p -t "$pane_id" -qv @claude-waiting-tool 2>/dev/null)
+    cwd=$(tmux show-option -p -t "$pane_id" -qv @claude-cwd 2>/dev/null)
+    cwd_short=$(basename "${cwd:-unknown}")
+    name=$(tmux show-option -p -t "$pane_id" -qv @claude-name 2>/dev/null)
+    location="${session}:${window}.${pane_idx}"
+
+    # Time waiting
+    time_str=""
+    ts="${pane_timestamps[$pane_id]:-}"
+    if [ -n "$ts" ] && [ -n "$NOW" ]; then
+      elapsed=$(python3 -c "print(int($NOW - $ts))" 2>/dev/null)
+      [ -n "$elapsed" ] && [ "$elapsed" -ge 0 ] && time_str=$(format_duration "$elapsed")
+    fi
+
+    # Build info block
+    info=""
+    [ -n "$name" ]         && info+="  Name:     ${name}\n"
+    info+="  Tab:      ${window_name}\n"
+    info+="  Project:  ${cwd_short}\n"
+    [ -n "$cwd" ]          && info+="  CWD:      ${cwd}\n"
+    [ -n "$waiting_tool" ] && info+="  Prompt:   ${waiting_tool}\n"
+    [ -n "$time_str" ]     && info+="  Waiting:  ${time_str}\n"
+    info+="  Location: ${location}"
+
+    pane_ids+=("$pane_id")
+    pane_sessions+=("$session")
+    pane_infos+=("$info")
+    log "INFO" "found waiting: pane=${pane_id} name='${name:-}' tool='${waiting_tool:-}' location=${location}"
+  done <<< "$pane_data"
+
+  count=${#pane_ids[@]}
+
+  if [ "$count" -eq 0 ]; then
+    log "INFO" "no waiting panes"
+    echo "No agents waiting for approval."
+    exit 0
+  fi
+
+  log "INFO" "showing per-pane UI for ${count} pane(s)"
+
+  # ── Per-pane decision loop ──
+  declare -A actions  # pane_id -> action
+
+  for i in "${!pane_ids[@]}"; do
+    pid="${pane_ids[$i]}"
+    sess="${pane_sessions[$i]}"
+    n=$(( i + 1 ))
+
+    # Header
+    gum style --border rounded --border-foreground 99 --padding "0 2" \
+      --foreground 99 --bold "Agent ${n}/${count}"
+
+    # Info
+    echo ""
+    printf '%b\n' "${pane_infos[$i]}"
+    echo ""
+
+    # Choose action (default: Skip)
+    action=$(gum choose --cursor.foreground 99 --selected.foreground 99 \
+      "Skip" "Yes — approve" "No — cancel (red)" "GoTo — navigate there") || {
+      # Escape/Ctrl-C from gum choose — abort entirely
+      log "INFO" "user escaped at pane ${n}/${count} — aborting, no actions taken"
+      echo ""
+      echo "Escaped. No actions taken."
+      exit 0
+    }
+
+    action_key="${action%% *}"
+    log "INFO" "pane=${pid} (${n}/${count}): user chose '${action_key}'"
+
+    if [ "$action_key" = "GoTo" ]; then
+      log "INFO" "GoTo selected — exiting popup, navigating to pane=${pid}"
+      # Write goto target to a temp file; the outer shell dispatches after popup closes
+      echo "${pid}	${sess}" > "$BAUBLE_TMP/approve-goto"
+      echo ""
+      echo "Navigating to ${pid}..."
+      exit 0
+    fi
+
+    actions["$pid"]="$action_key"
+  done
+
+  # ── Execute collected actions ──
+  approved=0
+  cancelled=0
+  skipped=0
+  echo ""
+
+  gum style --border-foreground 241 --foreground 241 "Results:"
+  echo ""
+
+  for i in "${!pane_ids[@]}"; do
+    pid="${pane_ids[$i]}"
+    action="${actions[$pid]:-Skip}"
+
+    # Re-check state
+    current_state=$(tmux show-option -p -t "$pid" -qv @bauble-state 2>/dev/null)
+    pane_exists=1
+    tmux display-message -p -t "$pid" '#{pane_id}' >/dev/null 2>&1 || pane_exists=0
+
+    name=$(tmux show-option -p -t "$pid" -qv @claude-name 2>/dev/null)
+    cwd=$(tmux show-option -p -t "$pid" -qv @claude-cwd 2>/dev/null)
+    short="${name:-$(basename "${cwd:-unknown}")}"
+
+    case "$action" in
+      Yes)
+        if [ "$pane_exists" -eq 0 ]; then
+          echo "  ⏭  ${short}  (pane closed)"
+          skipped=$((skipped + 1))
+        elif [ "$current_state" != "waiting" ]; then
+          echo "  ⏭  ${short}  (now ${current_state:-gone})"
+          skipped=$((skipped + 1))
+        else
+          log "INFO" "sending Enter to pane=${pid}"
+          tmux send-keys -t "$pid" Enter
+          log "INFO" "Enter sent to pane=${pid}"
+          echo "  ✓  ${short}  (approved)"
+          approved=$((approved + 1))
+        fi
+        ;;
+      No)
+        if [ "$pane_exists" -eq 0 ]; then
+          echo "  ⏭  ${short}  (pane closed)"
+          skipped=$((skipped + 1))
+        elif [ "$current_state" != "waiting" ]; then
+          echo "  ⏭  ${short}  (now ${current_state:-gone})"
+          skipped=$((skipped + 1))
+        else
+          log "INFO" "sending Escape to pane=${pid}"
+          tmux send-keys -t "$pid" Escape
+          tmux set-option -p -t "$pid" -q @bauble-state "cancelled" 2>/dev/null
+          tmux set-option -p -t "$pid" -q window-style "bg=#2b1a1a" 2>/dev/null
+          tmux set-option -p -t "$pid" -q window-active-style "bg=#2b1a1a" 2>/dev/null
+          local_win=$(tmux display-message -p -t "$pid" '#{window_id}' 2>/dev/null)
+          if [ -n "$local_win" ]; then
+            tmux set-window-option -t "$local_win" -q window-status-style 'bg=red,fg=white,bold' 2>/dev/null
+            tmux set-window-option -t "$local_win" -q window-status-current-style 'bg=red,fg=white,bold,underscore,overline' 2>/dev/null
+          fi
+          log "INFO" "pane=${pid} cancelled + red"
+          echo "  🚫 ${short}  (cancelled)"
+          cancelled=$((cancelled + 1))
+        fi
+        ;;
+      Skip|*)
+        echo "  —  ${short}  (skipped)"
+        skipped=$((skipped + 1))
+        ;;
+    esac
+  done
+
+  echo ""
+  [ "$approved" -gt 0 ]  && echo "Approved:  ${approved}"
+  [ "$cancelled" -gt 0 ] && echo "Cancelled: ${cancelled}"
+  [ "$skipped" -gt 0 ]   && echo "Skipped:   ${skipped}"
+
+  log "INFO" "done: approved=${approved} cancelled=${cancelled} skipped=${skipped}"
+  log "INFO" "popup exiting"
+  exit 0
+fi
+
+# ── Default mode: launch popup ──
+log "INFO" "default mode: launching popup"
+
+# Try Textual UI first (fastest, best UX)
+if command -v bauble-ui &>/dev/null; then
+  tmux display-popup -w 72 -h 28 -E "bauble-ui approve"
+  exit 0
+fi
+
+# Clean up any stale goto file
+GOTO_FILE="$BAUBLE_TMP/approve-goto"
+rm -f "$GOTO_FILE"
+
+if command -v gum &>/dev/null; then
+  tmux display-popup -w 72 -h 28 -E "bash -l '${SELF}' --popup"
+
+  # Check if GoTo was requested
+  if [ -f "$GOTO_FILE" ]; then
+    IFS=$'\t' read -r goto_pane goto_session < "$GOTO_FILE"
+    rm -f "$GOTO_FILE"
+    if [ -n "$goto_pane" ]; then
+      log "INFO" "dispatching goto: pane=${goto_pane} session=${goto_session}"
+      exec "$SELF" --goto "$goto_pane" "$goto_session"
+    fi
+  fi
+
+  log "INFO" "popup closed (no goto)"
+else
+  log "INFO" "gum not found — no fallback for interactive mode"
+  tmux display-message "tmux-approve-all requires gum"
+fi

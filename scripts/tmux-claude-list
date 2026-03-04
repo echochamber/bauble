@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# tmux-claude-list: enumerate all Claude Code panes with state/location
+# Part of bauble — ambient session UX for Claude Code
+#
+# Outputs all tmux panes that have @bauble-state set (Claude panes).
+# Sorted by (session, window, pane) — deterministic global ordering.
+#
+# Flags:
+#   --raw          TSV output for piping (session\twindow\tpane_idx\tpane_id\tstate\tcwd\tname)
+#   --state=STATE  Filter to panes matching STATE (waiting, done, working)
+#   (default)      Human-readable table with state emojis
+
+set -euo pipefail
+
+RAW=0
+FILTER_STATE=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --raw) RAW=1 ;;
+    --state=*) FILTER_STATE="${arg#--state=}" ;;
+    -h|--help)
+      echo "Usage: tmux-claude-list [--raw] [--state=waiting|done|working]"
+      exit 0
+      ;;
+  esac
+done
+
+# Enumerate all panes sorted by session, window, pane index
+pane_data=$(tmux list-panes -a -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_id}' 2>/dev/null | sort -t'	' -k1,1 -k2,2n -k3,3n)
+
+if [ -z "$pane_data" ]; then
+  [ "$RAW" -eq 0 ] && echo "No tmux panes found"
+  exit 0
+fi
+
+# Collect Claude panes (those with @bauble-state set)
+# Store as tab-separated lines in a variable (not array with echo -e)
+output=""
+while IFS=$'\t' read -r session window pane_idx pane_id; do
+  state=$(tmux show-option -p -t "$pane_id" -qv @bauble-state 2>/dev/null)
+  [ -z "$state" ] && continue
+
+  # Apply state filter
+  [ -n "$FILTER_STATE" ] && [ "$state" != "$FILTER_STATE" ] && continue
+
+  cwd=$(tmux show-option -p -t "$pane_id" -qv @claude-cwd 2>/dev/null)
+  cwd_short=$(basename "${cwd:-unknown}")
+  name=$(tmux show-option -p -t "$pane_id" -qv @claude-name 2>/dev/null)
+
+  output+="${session}	${window}	${pane_idx}	${pane_id}	${state}	${cwd_short}	${name}"$'\n'
+done <<< "$pane_data"
+
+# Trim trailing newline
+output="${output%$'\n'}"
+
+if [ -z "$output" ]; then
+  if [ "$RAW" -eq 0 ]; then
+    if [ -n "$FILTER_STATE" ]; then
+      echo "No Claude sessions with state: $FILTER_STATE"
+    else
+      echo "No Claude sessions"
+    fi
+  fi
+  exit 0
+fi
+
+if [ "$RAW" -eq 1 ]; then
+  printf '%s\n' "$output"
+  exit 0
+fi
+
+# Human-readable table
+printf "%-12s %-6s %-15s %-20s %s\n" "STATE" "PANE" "NAME" "PROJECT" "SESSION"
+printf "%-12s %-6s %-15s %-20s %s\n" "─────" "────" "────" "───────" "───────"
+while IFS=$'\t' read -r session window pane_idx pane_id state cwd_short name; do
+  case "$state" in
+    waiting)   emoji="🟡 waiting" ;;
+    done)      emoji="✅ done   " ;;
+    cancelled) emoji="🚫 cancel " ;;
+    working)   emoji="🔵 working" ;;
+    *)         emoji="  $state" ;;
+  esac
+  # Truncate name to 15 chars for column, show "—" if unnamed
+  if [[ -n "$name" ]]; then
+    if [[ ${#name} -gt 15 ]]; then
+      display_name="${name:0:12}..."
+    else
+      display_name="$name"
+    fi
+  else
+    display_name="—"
+  fi
+  printf "%-12s %-6s %-15s %-20s %s:%s.%s\n" "$emoji" "$pane_id" "$display_name" "$cwd_short" "$session" "$window" "$pane_idx"
+done <<< "$output"

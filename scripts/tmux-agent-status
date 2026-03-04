@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# tmux-agent-status: aggregate agent status for tmux status bar
+# Part of bauble — ambient session UX for Claude Code
+#
+# Outputs a compact status string for use in tmux status-right.
+# Reads bauble-state.json (source of truth) and detects cancelled
+# sessions by checking for stale working/waiting entries.
+# Also shows cullis yolo mode with time remaining and scope coverage.
+#
+# Usage in ~/.tmux.conf:
+#   set -g status-right '#(~/.claude/scripts/tmux-agent-status)'
+#   set -g status-interval 5
+
+STATE_FILE="$HOME/.claude/hooks/bauble-state.json"
+
+# Load config — resolve through symlinks to find config dir
+_AS_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$_AS_SOURCE" ]; do
+  _AS_DIR="$(cd "$(dirname "$_AS_SOURCE")" && pwd)"
+  _AS_SOURCE="$(readlink "$_AS_SOURCE")"
+  [[ "$_AS_SOURCE" != /* ]] && _AS_SOURCE="$_AS_DIR/$_AS_SOURCE"
+done
+_AS_SCRIPT_DIR="$(cd "$(dirname "$_AS_SOURCE")" && pwd)"
+_AS_CONF="$(dirname "$_AS_SCRIPT_DIR")/config/bauble.conf"
+[ -f "$_AS_CONF" ] && source "$_AS_CONF"
+
+CANCEL_THRESHOLD="${BAUBLE_CANCEL_THRESHOLD:-30}"
+
+# --- Cancel detection + state counting from JSON ---
+# Python reads the JSON, detects stale entries, updates tmux state,
+# and outputs counts as "waiting done cancelled" for bash to consume.
+read -r waiting done_count <<< "$(python3 -c "
+import json, time, subprocess, os
+
+path = '$STATE_FILE'
+threshold = $CANCEL_THRESHOLD
+
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (OSError, json.JSONDecodeError):
+    print('0 0')
+    exit(0)
+
+if not data:
+    print('0 0')
+    exit(0)
+
+now = time.time()
+waiting = 0
+done = 0
+modified = False
+
+# Get live panes with window activity time for pruning + cancel detection.
+# Note: #{window_activity} is window-level (no per-pane activity in tmux).
+# This is sufficient for cancel detection — if the whole window is idle,
+# the agent is likely cancelled.
+result = subprocess.run(
+    ['tmux', 'list-panes', '-a', '-F', '#{pane_id}\t#{window_activity}'],
+    capture_output=True, text=True
+)
+live_panes = {}
+if result.stdout.strip():
+    for line in result.stdout.strip().split('\n'):
+        parts = line.split('\t', 1)
+        try:
+            activity = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+        except (ValueError, IndexError):
+            activity = 0
+        live_panes[parts[0]] = activity
+
+dead = []
+for pane_id, info in data.items():
+    # Prune dead panes
+    if pane_id not in live_panes:
+        dead.append(pane_id)
+        continue
+
+    state = info.get('state', '')
+    updated_at = info.get('updated_at', 0)
+    age = now - updated_at
+
+    # Cancel detection: hooks stale AND no recent window activity.
+    # During active work, Claude streams output even between hook events,
+    # so window_activity stays fresh. A cancelled session goes silent.
+    window_activity = live_panes.get(pane_id, 0)
+    pane_idle = now - window_activity
+
+    if state == 'working' and age > threshold and pane_idle > 15:
+        # Both hook state and terminal output are stale — treat as done
+        info['state'] = 'done'
+        info['updated_at'] = now
+        modified = True
+
+        # Update tmux visual state to done (green)
+        win_id = info.get('window_id', '')
+        subprocess.run(['tmux', 'set-option', '-p', '-t', pane_id, '-q', 'window-style', 'bg=${BAUBLE_COLOR_DONE:-#192b1e}'], capture_output=True)
+        subprocess.run(['tmux', 'set-option', '-p', '-t', pane_id, '-q', 'window-active-style', 'bg=${BAUBLE_COLOR_DONE:-#192b1e}'], capture_output=True)
+        subprocess.run(['tmux', 'set-option', '-p', '-t', pane_id, '-q', '@bauble-state', 'done'], capture_output=True)
+        if win_id:
+            subprocess.run(['tmux', 'set-window-option', '-t', win_id, '-q', 'window-status-style', 'bg=green,fg=black,bold'], capture_output=True)
+            subprocess.run(['tmux', 'set-window-option', '-t', win_id, '-q', 'window-status-current-style', 'bg=green,fg=black,bold,underscore,overline'], capture_output=True)
+
+    state = info.get('state', '')
+    if state == 'waiting': waiting += 1
+    elif state == 'done': done += 1
+
+for pane_id in dead:
+    del data[pane_id]
+    modified = True
+
+if modified:
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+    os.replace(tmp, path)
+
+print(f'{waiting} {done}')
+" 2>/dev/null)"
+
+# Default to 0 if python failed
+waiting=${waiting:-0}
+done_count=${done_count:-0}
+
+# --- Cullis yolo mode ---
+yolo_str=""
+CULLIS_STATE="$HOME/.claude/hooks/cullis-active.json"
+if [[ -f "$CULLIS_STATE" ]]; then
+  # Get yolo time remaining, scope, and scope_override in one python call
+  read -r yolo_time yolo_scope <<< "$(python3 -c "
+import json, sys
+from datetime import datetime, timezone
+try:
+    with open('$CULLIS_STATE') as f:
+        data = json.load(f)
+    yolo = data.get('yolo', {})
+    exp = yolo.get('expires_at', '')
+    if not exp:
+        sys.exit(0)
+    if exp == 'never' or exp is None:
+        time_str = 'indef'
+    else:
+        exp_dt = datetime.fromisoformat(exp)
+        now = datetime.now(timezone.utc)
+        remaining = (exp_dt - now).total_seconds()
+        if remaining <= 0:
+            sys.exit(0)
+        hours = int(remaining // 3600)
+        minutes = int((remaining % 3600) // 60)
+        if hours > 0:
+            time_str = f'{hours}h{minutes:02d}m'
+        else:
+            time_str = f'{minutes}m'
+    scope = yolo.get('scope_override', '*')
+    print(f'{time_str} {scope}')
+except Exception:
+    sys.exit(0)
+" 2>/dev/null)"
+
+  if [[ -n "$yolo_time" ]]; then
+    # Count Claude sessions and scope matches (from state file)
+    claude_total=0
+    claude_matched=0
+
+    all_panes=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null)
+    for pane in $all_panes; do
+      cwd=$(tmux show-option -p -t "$pane" -qv @claude-cwd 2>/dev/null)
+      [[ -z "$cwd" ]] && continue
+      claude_total=$((claude_total + 1))
+
+      # Check if this session's cwd matches the yolo scope
+      if [[ "$yolo_scope" == "*" ]]; then
+        claude_matched=$((claude_matched + 1))
+      elif [[ "$cwd" == $yolo_scope ]]; then
+        claude_matched=$((claude_matched + 1))
+      elif [[ "$cwd" == "$yolo_scope"/* ]]; then
+        claude_matched=$((claude_matched + 1))
+      elif [[ "$cwd" == "$yolo_scope" ]]; then
+        claude_matched=$((claude_matched + 1))
+      fi
+    done
+
+    if [[ "$claude_total" -gt 0 ]]; then
+      yolo_str="#[fg=red,bold]🔓 ${yolo_time} (${claude_matched}/${claude_total})#[default]"
+    else
+      yolo_str="#[fg=red,bold]🔓 ${yolo_time}#[default]"
+    fi
+  fi
+fi
+
+# --- Build output ---
+parts=()
+[ "$waiting" -gt 0 ] && parts+=("#[fg=yellow,bold]🟡 ${waiting}#[default]")
+[ "$done_count" -gt 0 ] && parts+=("#[fg=green]✅ ${done_count}#[default]")
+[ -n "$yolo_str" ] && parts+=("$yolo_str")
+
+if [ ${#parts[@]} -eq 0 ]; then
+  echo ""
+  exit 0
+fi
+
+IFS=' '
+echo "${parts[*]}"

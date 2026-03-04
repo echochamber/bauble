@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# bauble-play-sound — Cross-platform sound wrapper for bauble hooks.
+# Usage: bauble-play-sound <done|waiting>
+#
+# macOS: afplay with system sounds (Hero.aiff, Glass.aiff)
+# Linux: pw-play > paplay > aplay > mpv > ffplay with freedesktop sounds
+# Fallback: silent no-op (no player found, no sound file, BAUBLE_SOUND_ENABLED=0)
+#
+# User overrides via bauble.conf or env:
+#   BAUBLE_SOUND_ENABLED=0    disable all sounds
+#   BAUBLE_SOUND_DONE=path    custom sound file for "done"
+#   BAUBLE_SOUND_WAITING=path custom sound file for "waiting"
+
+# Resolve through symlinks to find the actual script directory
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+# Load config (picks up user overrides)
+CONF="$(dirname "$SCRIPT_DIR")/config/bauble.conf"
+[ -f "$CONF" ] && source "$CONF"
+
+# Check if sounds are disabled
+if [ "${BAUBLE_SOUND_ENABLED:-1}" = "0" ]; then
+  exit 0
+fi
+
+sound_name="${1:-done}"
+
+# Resolve sound file path
+resolve_sound_file() {
+  local name="$1"
+  local platform
+  platform="$(uname -s)"
+
+  # User override
+  if [ "$name" = "done" ] && [ -n "${BAUBLE_SOUND_DONE:-}" ]; then
+    [ -f "$BAUBLE_SOUND_DONE" ] && echo "$BAUBLE_SOUND_DONE" && return
+  fi
+  if [ "$name" = "waiting" ] && [ -n "${BAUBLE_SOUND_WAITING:-}" ]; then
+    [ -f "$BAUBLE_SOUND_WAITING" ] && echo "$BAUBLE_SOUND_WAITING" && return
+  fi
+
+  # Platform defaults
+  if [ "$platform" = "Darwin" ]; then
+    case "$name" in
+      done)    echo "/System/Library/Sounds/Hero.aiff" ;;
+      waiting) echo "/System/Library/Sounds/Glass.aiff" ;;
+    esac
+  else
+    # Linux: freedesktop sound theme
+    local fd_dir="/usr/share/sounds/freedesktop/stereo"
+    case "$name" in
+      done)
+        for f in "$fd_dir/complete.oga" "$fd_dir/bell.oga" "$fd_dir/message.oga"; do
+          [ -f "$f" ] && echo "$f" && return
+        done
+        ;;
+      waiting)
+        for f in "$fd_dir/dialog-information.oga" "$fd_dir/message-new-instant.oga" "$fd_dir/bell.oga"; do
+          [ -f "$f" ] && echo "$f" && return
+        done
+        ;;
+    esac
+  fi
+}
+
+# Find a player
+find_player() {
+  local platform
+  platform="$(uname -s)"
+
+  if [ "$platform" = "Darwin" ]; then
+    command -v afplay && return
+  fi
+
+  # Linux: try players in preference order
+  for player in pw-play paplay aplay mpv ffplay; do
+    command -v "$player" &>/dev/null && echo "$player" && return
+  done
+}
+
+sound_file="$(resolve_sound_file "$sound_name")"
+[ -z "$sound_file" ] && exit 0
+[ ! -f "$sound_file" ] && exit 0
+
+player="$(find_player)"
+[ -z "$player" ] && exit 0
+
+# Build play command (some players need flags for non-blocking use)
+case "$(basename "$player")" in
+  afplay|pw-play|paplay|aplay)
+    "$player" "$sound_file" &>/dev/null & disown
+    ;;
+  mpv)
+    "$player" --no-video --really-quiet "$sound_file" &>/dev/null & disown
+    ;;
+  ffplay)
+    "$player" -nodisp -autoexit -loglevel quiet "$sound_file" &>/dev/null & disown
+    ;;
+esac
+
+exit 0

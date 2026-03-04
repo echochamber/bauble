@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# tmux-glow-viewer: wrapper that runs glow then offers save options
+# Called by tmux-glow for the actual split pane content.
+#
+# After quitting glow (q), shows a prompt:
+#   s = save copy to $BAUBLE_SNAPS_DIR (default: ~/notes/snaps/)
+#   c = copy file path to clipboard
+#   q/enter = close (no save)
+#
+# Saved files include a provenance header with the Claude session ID,
+# formatted appropriately for the file type (comment or frontmatter).
+
+FILE="$1"
+BASENAME="$(basename "$FILE")"
+STEM="${BASENAME%.md}"
+EXT="${BASENAME##*.}"
+
+# Load config
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  _DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$_DIR/$SOURCE"
+done
+_SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+_CONF="$(dirname "$_SCRIPT_DIR")/config/bauble.conf"
+[ -f "$_CONF" ] && source "$_CONF"
+BAUBLE_SNAPS_DIR="${BAUBLE_SNAPS_DIR:-$HOME/notes/snaps}"
+
+glow -p "$FILE"
+
+# Skip save prompt for files already in ~/notes/
+BAUBLE_NOTES_DIR="${BAUBLE_NOTES_DIR:-$HOME/notes}"
+case "$FILE" in
+  "$BAUBLE_NOTES_DIR"/*)
+    exit 0
+    ;;
+esac
+
+echo ""
+echo "  s = save to ${BAUBLE_SNAPS_DIR/#$HOME/\~}/   c = copy path   q/enter = close"
+read -rsn1 KEY
+
+case "$KEY" in
+  s|S)
+    mkdir -p "$BAUBLE_SNAPS_DIR"
+
+    # Find the Claude session ID (most recently modified .jsonl in project sessions)
+    SESSION_ID=""
+    PANE_CWD=$(tmux display-message -p '#{pane_current_path}' 2>/dev/null)
+    if [ -z "$PANE_CWD" ]; then
+      PANE_CWD="$(pwd)"
+    fi
+    # Walk up to find the git root, then derive the claude project path
+    GIT_ROOT=$(cd "$PANE_CWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$GIT_ROOT" ]; then
+      # Claude project dir uses the absolute path with / replaced by -
+      PROJECT_DIR="$HOME/.claude/projects/-$(echo "$GIT_ROOT" | sed 's|^/||; s|/|-|g')"
+      if [ -d "$PROJECT_DIR" ]; then
+        LATEST=$(ls -t "$PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)
+        if [ -n "$LATEST" ]; then
+          SESSION_ID="$(basename "$LATEST" .jsonl)"
+          SESSION_ID="${SESSION_ID:0:8}"
+        fi
+      fi
+    fi
+
+    # Build provenance header based on file extension
+    TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
+    DEST="${BAUBLE_SNAPS_DIR}/${STEM}-$(date +%Y%m%d-%H%M%S).${EXT}"
+
+    case "$EXT" in
+      md)
+        HEADER="---
+source: ${FILE}
+saved: ${TIMESTAMP}
+claude_session: ${SESSION_ID:-unknown}
+---
+
+"
+        ;;
+      py)
+        HEADER="# source: ${FILE}
+# saved: ${TIMESTAMP}
+# claude_session: ${SESSION_ID:-unknown}
+
+"
+        ;;
+      js|ts|jsx|tsx|svelte|css|scss|json|jsonl)
+        HEADER="// source: ${FILE}
+// saved: ${TIMESTAMP}
+// claude_session: ${SESSION_ID:-unknown}
+
+"
+        ;;
+      sh|bash|zsh|yml|yaml|toml|conf)
+        HEADER="# source: ${FILE}
+# saved: ${TIMESTAMP}
+# claude_session: ${SESSION_ID:-unknown}
+
+"
+        ;;
+      sql)
+        HEADER="-- source: ${FILE}
+-- saved: ${TIMESTAMP}
+-- claude_session: ${SESSION_ID:-unknown}
+
+"
+        ;;
+      html|xml|svg)
+        HEADER="<!-- source: ${FILE} -->
+<!-- saved: ${TIMESTAMP} -->
+<!-- claude_session: ${SESSION_ID:-unknown} -->
+
+"
+        ;;
+      *)
+        HEADER="# source: ${FILE}
+# saved: ${TIMESTAMP}
+# claude_session: ${SESSION_ID:-unknown}
+
+"
+        ;;
+    esac
+
+    printf '%s' "$HEADER" > "$DEST"
+    cat "$FILE" >> "$DEST"
+    echo "  Saved to $DEST"
+    sleep 1
+    ;;
+  c|C)
+    echo -n "$FILE" | pbcopy
+    echo "  Copied to clipboard"
+    sleep 1
+    ;;
+esac

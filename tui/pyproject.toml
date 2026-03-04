@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bauble-tui"
+version = "0.1.0"
+description = "Textual TUI for bauble tmux session UX"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.86.0",
+]
+
+[project.scripts]
+bauble-ui = "bauble_tui.attach:main"
+bauble-daemon = "bauble_tui.daemon:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bauble_tui"]
+sources = ["src"]

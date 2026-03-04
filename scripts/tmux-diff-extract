@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# tmux-diff-extract: extract the last session diff for a file from pane scrollback
+# Helper for tmux-diff. Captures indented content after the last Write/Update/Edit
+# marker for the given file path.
+#
+# Usage: tmux-diff-extract <filepath> [scrollback-lines]
+# Writes extracted diff to stdout.
+
+FILEPATH="$1"
+SCROLLBACK_LINES="${2:-5000}"
+
+if [ -z "$FILEPATH" ]; then
+  echo "Usage: tmux-diff-extract <filepath> [scrollback-lines]" >&2
+  exit 1
+fi
+
+if [ "$SCROLLBACK_LINES" = "-" ]; then
+  CAPTURE_START="-"
+else
+  CAPTURE_START="-${SCROLLBACK_LINES}"
+fi
+
+# Normalize to tilde form for matching
+HOME_PATH=$(echo "$FILEPATH" | sed "s|^$HOME|~|")
+
+SCROLLBACK=$(tmux capture-pane -p -S "$CAPTURE_START")
+
+# Find the last edit marker line number for this file
+marker_line=$(
+  echo "$SCROLLBACK" \
+  | grep -nE "⏺ (Write|Update|Edit)\($HOME_PATH\)|⏺ (Write|Update|Edit)\($FILEPATH\)" \
+  | tail -1 \
+  | cut -d: -f1
+)
+
+if [ -z "$marker_line" ]; then
+  echo "(no session diff found for $FILEPATH)"
+  exit 0
+fi
+
+# Print header
+echo "Session diff: $(basename "$FILEPATH")"
+echo "File: $FILEPATH"
+echo ""
+
+# Extract content after the marker: indented lines until next ⏺ marker or
+# a line that looks like a conversation boundary
+echo "$SCROLLBACK" | tail -n +"$((marker_line))" | head -1  # The marker line itself
+echo ""
+echo "$SCROLLBACK" | tail -n +"$((marker_line + 1))" | awk '
+  /^⏺/ { exit }
+  /^[A-Z]/ && NR > 3 { exit }
+  /^$/ && blank++ > 2 { exit }
+  /^[^ \t]/ && !/^[0-9 ]*[-+]/ && NR > 1 { exit }
+  { blank=0; print }
+'

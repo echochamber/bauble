@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# tmux-glow: scan current pane for .md paths, open selection in glow split
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to tmux prefix+g, m. Scans the pane scrollback for markdown file paths,
+# validates they exist on disk, and opens them in a glow side pane.
+
+# Resolve through symlinks to find the actual script directory
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+VIEWER="$SCRIPT_DIR/tmux-glow-viewer"
+
+# Load config
+CONF="$(dirname "$SCRIPT_DIR")/config/bauble.conf"
+[ -f "$CONF" ] && source "$CONF"
+BAUBLE_MAX_MENU_ITEMS="${BAUBLE_MAX_MENU_ITEMS:-8}"
+BAUBLE_SCROLLBACK_LINES="${BAUBLE_SCROLLBACK_LINES:--}"
+BAUBLE_SPLIT_WIDTH="${BAUBLE_SPLIT_WIDTH:-100}"
+
+# Escape single quotes for tmux split-window arguments
+sq() { local s="$1"; echo "${s//\'/\'\\\'\'}"; }
+
+# Compute adaptive split: horizontal if viewer takes <50% of pane width, else vertical
+_PANE_W=$(tmux display-message -p '#{pane_width}')
+_SPLIT_W="$BAUBLE_SPLIT_WIDTH"
+if [ $((_PANE_W / 2)) -gt "$_SPLIT_W" ]; then
+  SPLIT="split-window -h -l $_SPLIT_W"
+else
+  SPLIT="split-window -v -l 60%"
+fi
+
+# Build capture-pane args: "-" means full scrollback, otherwise -N lines
+if [ "$BAUBLE_SCROLLBACK_LINES" = "-" ]; then
+  CAPTURE_START="-"
+else
+  CAPTURE_START="-${BAUBLE_SCROLLBACK_LINES}"
+fi
+
+# Capture scrollback and extract .md file paths
+# Handles: file:///abs/path.md, /abs/path.md, ~/path.md
+# Uses tac to preserve most-recent-first ordering after dedup
+paths=$(
+  tmux capture-pane -p -S "$CAPTURE_START" \
+  | grep -oE '(file:///[^ "]+\.md|/[A-Za-z][^ "]+\.md|~/[^ "]+\.md)' \
+  | sed 's|^file://||' \
+  | sed "s|^~|$HOME|" \
+  | tac \
+  | awk '!seen[$0]++' \
+  | head -n "$BAUBLE_MAX_MENU_ITEMS"
+)
+
+# Filter to files that actually exist
+existing=()
+while IFS= read -r p; do
+  [ -n "$p" ] && [ -f "$p" ] && existing+=("$p")
+done <<< "$paths"
+
+if [ ${#existing[@]} -eq 0 ]; then
+  tmux display-message "No .md files found in pane"
+  exit 0
+fi
+
+if [ ${#existing[@]} -eq 1 ]; then
+  tmux $SPLIT "'$(sq "$VIEWER")' '$(sq "${existing[0]}")'"
+  exit 0
+fi
+
+# Multiple matches — try Textual, fall back to display-menu
+
+# Try Textual UI first (fastest, best UX)
+if command -v bauble-ui &>/dev/null; then
+  tmux display-popup -w 80 -h 18 -E "bauble-ui glow"
+  exit 0
+fi
+
+# Display-menu fallback
+args=()
+for p in "${existing[@]}"; do
+  name=$(basename "$p")
+  dir=$(basename "$(dirname "$p")")
+  args+=("$dir/$name" "" "$SPLIT \"'$(sq "$VIEWER")' '$(sq "$p")'\"")
+done
+tmux display-menu -T "Open with glow" "${args[@]}"

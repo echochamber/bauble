@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# tmux-claude-picker: popup menu of all Claude sessions grouped by state
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to prefix+g, s. Shows all Claude panes in a filterable popup
+# (gum filter) or display-menu fallback, grouped: Waiting → Cancelled → Done → Working.
+# Uses --goto self-dispatch for cross-session navigation.
+#
+# Each entry shows:
+#   <emoji> <name> <context> (<time-in-state>) [location]
+# Where context is:
+#   - For waiting: the tool being approved (from @claude-waiting-tool)
+#   - For all: bead ID if window was claimed (from #{window_name})
+#
+# Modes:
+#   (default)  Launch popup with gum filter, or fall back to display-menu
+#   --popup    Runs inside the tmux popup: enumerate → gum filter → goto
+#   --goto     Navigate to a specific pane (called from selection handler)
+
+set -euo pipefail
+
+SELF="$HOME/.claude/scripts/tmux-claude-picker"
+STATE_FILE="$HOME/.claude/hooks/bauble-state.json"
+BAUBLE_TMP="/tmp/bauble-${UID}"
+mkdir -p -m 700 "$BAUBLE_TMP" 2>/dev/null
+
+# ── --goto handler: navigate to a specific pane ──
+if [[ "${1:-}" == "--goto" ]]; then
+  pane_id="${2:-}"
+  target_session="${3:-}"
+  current_session=$(tmux display-message -p '#{session_name}' 2>/dev/null)
+  [ "$target_session" != "$current_session" ] && tmux switch-client -t "$target_session" 2>/dev/null
+  tmux select-window -t "$pane_id" 2>/dev/null
+  tmux select-pane -t "$pane_id" 2>/dev/null
+  exit 0
+fi
+
+# ── Default mode (no args): launch popup or fall back ──
+# Skip enumeration here — the popup re-invokes with --popup which does it.
+if [[ "${1:-}" != "--popup" ]]; then
+  # Try Textual UI first (fastest, best UX)
+  if command -v bauble-ui &>/dev/null; then
+    tmux display-popup -w 70 -h 22 -E "bauble-ui picker"
+    exit 0
+  fi
+  if command -v gum &>/dev/null; then
+    tmux display-popup -w 70 -h 22 -E "bash '${SELF}' --popup"
+  else
+    # Fall through to enumeration + display-menu below
+    _USE_MENU=1
+  fi
+  # If we launched the popup, we're done
+  [ "${_USE_MENU:-}" != "1" ] && exit 0
+fi
+
+# ── Shared: read state file, compute timestamps ──
+# Reached by: --popup mode (inside popup) or display-menu fallback
+
+# Ensure PATH includes common tool locations (popup shells may not source profile)
+for p in /opt/homebrew/bin /usr/local/bin "$HOME/.claude/scripts"; do
+  [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && PATH="$p:$PATH"
+done
+
+declare -A pane_timestamps
+if [ -f "$STATE_FILE" ]; then
+  while IFS=$'\t' read -r pid ts; do
+    [ -n "$pid" ] && pane_timestamps["$pid"]="$ts"
+  done < <(STATE_FILE="$STATE_FILE" python3 -c "
+import json, os
+try:
+    with open(os.environ['STATE_FILE']) as f:
+        data = json.load(f)
+    for pid, info in data.items():
+        if isinstance(info, dict) and 'updated_at' in info:
+            print(f'{pid}\t{info[\"updated_at\"]}')
+except Exception:
+    pass
+" 2>/dev/null)
+fi
+
+NOW=$(python3 -c "import time; print(time.time())" 2>/dev/null)
+
+format_duration() {
+  local secs="${1%.*}"
+  [ -z "$secs" ] && return
+  if [ "$secs" -lt 60 ]; then
+    echo "<1m"
+  elif [ "$secs" -lt 3600 ]; then
+    echo "$(( secs / 60 ))m"
+  elif [ "$secs" -lt 86400 ]; then
+    local h=$(( secs / 3600 ))
+    local m=$(( (secs % 3600) / 60 ))
+    if [ "$m" -gt 0 ]; then
+      echo "${h}h${m}m"
+    else
+      echo "${h}h"
+    fi
+  else
+    echo "$(( secs / 86400 ))d"
+  fi
+}
+
+# ── Enumerate all Claude panes ──
+
+pane_data=$(tmux list-panes -a -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_id}	#{window_name}' 2>/dev/null | sort -t'	' -k1,1 -k2,2n -k3,3n)
+
+if [ -z "$pane_data" ]; then
+  tmux display-message "No Claude sessions"
+  exit 0
+fi
+
+# Collect Claude panes grouped by state
+waiting_lines=""
+cancelled_lines=""
+done_lines=""
+working_lines=""
+
+while IFS=$'\t' read -r session window pane_idx pane_id window_name; do
+  state=$(tmux show-option -p -t "$pane_id" -qv @bauble-state 2>/dev/null)
+  [ -z "$state" ] && continue
+
+  cwd=$(tmux show-option -p -t "$pane_id" -qv @claude-cwd 2>/dev/null)
+  cwd_short=$(basename "${cwd:-unknown}")
+  name=$(tmux show-option -p -t "$pane_id" -qv @claude-name 2>/dev/null)
+  label="${name:-$cwd_short}"
+
+  time_str=""
+  ts="${pane_timestamps[$pane_id]:-}"
+  if [ -n "$ts" ] && [ -n "$NOW" ]; then
+    elapsed=$(python3 -c "print(int($NOW - $ts))" 2>/dev/null)
+    if [ -n "$elapsed" ] && [ "$elapsed" -ge 0 ]; then
+      time_str=$(format_duration "$elapsed")
+    fi
+  fi
+
+  waiting_tool=""
+  if [ "$state" = "waiting" ]; then
+    waiting_tool=$(tmux show-option -p -t "$pane_id" -qv @claude-waiting-tool 2>/dev/null)
+  fi
+
+  bead_ctx=""
+  if [[ "$window_name" =~ ^[A-Za-z0-9]+-?[A-Za-z0-9]+:\ .+ ]]; then
+    bead_ctx="${window_name%%:*}"
+  fi
+
+  location="${session}:${window}.${pane_idx}"
+
+  line="${pane_id}	${session}	${label}	${location}	${time_str}	${waiting_tool}	${bead_ctx}"
+  case "$state" in
+    waiting)   waiting_lines+="${line}"$'\n' ;;
+    cancelled) cancelled_lines+="${line}"$'\n' ;;
+    done)      done_lines+="${line}"$'\n' ;;
+    *)         working_lines+="${line}"$'\n' ;;
+  esac
+done <<< "$pane_data"
+
+# ── --popup mode: gum filter inside the tmux popup ──
+if [[ "${1:-}" == "--popup" ]]; then
+  # Build clean display lines + a lookup file mapping line content → nav target.
+  # This keeps navigation data out of the visible text shown by gum filter.
+  LOOKUP_FILE="$BAUBLE_TMP/picker-$$.tsv"
+  trap 'rm -f "$LOOKUP_FILE"' EXIT
+
+  build_group_lines() {
+    local emoji="$1" lines="$2"
+    [ -z "$lines" ] && return
+    while IFS=$'\t' read -r pane_id session display_label location time_str waiting_tool bead_ctx; do
+      [ -z "$pane_id" ] && continue
+
+      # Build two-line display: main line + detail line
+      local main="${emoji} ${display_label}"
+      [ -n "$bead_ctx" ] && main="${main}  #${bead_ctx}"
+
+      local detail=""
+      [ -n "$waiting_tool" ] && detail="→ ${waiting_tool}  "
+      [ -n "$time_str" ] && detail="${detail}${time_str}  "
+      detail="${detail}${location}"
+
+      local line="${main}  ${detail}"
+
+      echo "$line"
+      # Lookup: display_line → pane_id session
+      printf '%s\t%s\t%s\n' "$line" "$pane_id" "$session" >> "$LOOKUP_FILE"
+    done <<< "$lines"
+  }
+
+  all_lines=""
+  for group_args in \
+    "🟡:$waiting_lines" \
+    "🚫:$cancelled_lines" \
+    "✅:$done_lines" \
+    "🔵:$working_lines"; do
+    emoji="${group_args%%:*}"
+    lines="${group_args#*:}"
+    group=$(build_group_lines "$emoji" "$lines")
+    [ -n "$group" ] && { [ -n "$all_lines" ] && all_lines+=$'\n'; all_lines+="$group"; }
+  done
+
+  if [ -z "$all_lines" ]; then
+    echo "No Claude sessions found."
+    exit 0
+  fi
+
+  # Count lines for sizing
+  line_count=$(echo "$all_lines" | wc -l | tr -d ' ')
+
+  # Auto-select if only one session
+  if [ "$line_count" -eq 1 ]; then
+    selected="$all_lines"
+  else
+    # Two-phase: show list, wait for mode selection
+    # /  → fuzzy filter (cursor in text input)
+    # ↵ or ↑↓ → browse mode (arrow keys only, no text input)
+    clear
+    gum style --foreground 99 --bold "Claude Sessions"
+    echo ""
+    echo "$all_lines"
+    echo ""
+    gum style --foreground 241 "↵ browse  / filter  esc quit"
+
+    IFS= read -rsn1 key
+    case "$key" in
+      /)
+        # Fuzzy filter mode (no --height; popup size is the constraint)
+        clear
+        selected=$(echo "$all_lines" | gum filter \
+          --fuzzy \
+          --header "Claude Sessions" \
+          --header.foreground 99 \
+          --placeholder "Type to filter..." \
+          --prompt "> " \
+          --prompt.foreground 99 \
+          --indicator.foreground 99 \
+          --strict \
+          --width 0) || exit 0
+        ;;
+      $'\x1b')
+        # Could be bare Escape or start of arrow key sequence (\x1b[A etc.)
+        IFS= read -rsn2 -t 0.1 rest || true
+        if [ -z "$rest" ]; then
+          # Bare escape → quit
+          exit 0
+        fi
+        # Arrow key → fall through to browse mode
+        clear
+        selected=$(echo "$all_lines" | gum choose \
+          --cursor.foreground 99 \
+          --selected.foreground 99 \
+          --header "Claude Sessions") || exit 0
+        ;;
+      *)
+        # Enter or any other key → browse mode
+        clear
+        selected=$(echo "$all_lines" | gum choose \
+          --cursor.foreground 99 \
+          --selected.foreground 99 \
+          --header "Claude Sessions") || exit 0
+        ;;
+    esac
+  fi
+
+  # Look up navigation target from the lookup file
+  pane_id=""
+  nav_session=""
+  while IFS=$'\t' read -r display_line pid sess; do
+    if [ "$display_line" = "$selected" ]; then
+      pane_id="$pid"
+      nav_session="$sess"
+      break
+    fi
+  done < "$LOOKUP_FILE"
+
+  if [ -n "$pane_id" ] && [ -n "$nav_session" ]; then
+    exec "$SELF" --goto "$pane_id" "$nav_session"
+  fi
+  exit 0
+fi
+
+# ── Display-menu fallback (no gum available) ──
+args=()
+has_entries=0
+
+# Escape single quotes for tmux run-shell arguments
+sq() { local s="$1"; echo "${s//\'/\'\\\'\'}"; }
+
+add_menu_group() {
+  local emoji="$1" lines="$2" header="$3"
+  [ -z "$lines" ] && return
+  [ "$has_entries" -eq 1 ] && args+=("" "" "")
+  args+=("-${header}-" "" "")
+  has_entries=1
+  while IFS=$'\t' read -r pane_id session display_label location time_str waiting_tool bead_ctx; do
+    [ -z "$pane_id" ] && continue
+    local label="${emoji} ${display_label}"
+    [ -n "$bead_ctx" ] && label="${label} #${bead_ctx}"
+    [ -n "$waiting_tool" ] && label="${label} → ${waiting_tool}"
+    [ -n "$time_str" ] && label="${label} (${time_str})"
+    label="${label} [${location}]"
+    args+=("$label" "" "run-shell -b '$(sq "$SELF") --goto $(sq "$pane_id") $(sq "$session")'")
+  done <<< "$lines"
+}
+
+add_menu_group "🟡" "$waiting_lines" "Waiting"
+add_menu_group "🚫" "$cancelled_lines" "Cancelled"
+add_menu_group "✅" "$done_lines" "Done"
+add_menu_group "🔵" "$working_lines" "Working"
+
+if [ "$has_entries" -eq 0 ]; then
+  tmux display-message "No Claude sessions"
+  exit 0
+fi
+
+tmux display-menu -T "Claude Sessions" -H 'bg=blue,fg=white,bold' -- "${args[@]}"

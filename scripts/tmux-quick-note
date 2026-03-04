@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# tmux-quick-note: gum-powered quick capture popup
+# Part of bauble — ambient session UX for Claude Code
+#
+# Bound to tmux prefix+g, c. Opens a gum popup in a tmux display-popup
+# to capture a quick note. Saves to ~/notes/ with timestamp filename.
+#
+# Requires: gum (https://github.com/charmbracelet/gum)
+
+set -euo pipefail
+
+# Load config — resolve through symlinks to find config dir
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  _DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$_DIR/$SOURCE"
+done
+_SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+_CONF="$(dirname "$_SCRIPT_DIR")/config/bauble.conf"
+[ -f "$_CONF" ] && source "$_CONF"
+BAUBLE_QUICK_DIR="${BAUBLE_QUICK_DIR:-$HOME/notes/quick}"
+
+NOTES_DIR="$BAUBLE_QUICK_DIR"
+mkdir -p "$NOTES_DIR"
+
+# Try Textual UI first (already inside a tmux popup from keybinding)
+if command -v bauble-ui &>/dev/null; then
+  exec bauble-ui note
+fi
+
+# Header
+gum style --border rounded --border-foreground 99 --padding "0 2" \
+  --foreground 99 --bold "Quick Capture"
+
+echo ""
+
+# Get title
+TITLE=$(gum input --placeholder "Title (optional — Enter to skip)" \
+  --prompt "  " --prompt.foreground 99 --width 60) || exit 0
+
+# Get body
+BODY=$(gum write --placeholder "Write your note... (Ctrl+D to save, Esc to cancel)" \
+  --prompt "  " --width 60 --height 8 --char-limit 4000) || exit 0
+
+# Nothing entered
+if [[ -z "$TITLE" && -z "$BODY" ]]; then
+  gum style --foreground 241 "  Nothing to save."
+  sleep 1
+  exit 0
+fi
+
+# Build filename from title or timestamp
+TS=$(date +"%Y-%m-%d-%H%M")
+if [[ -n "$TITLE" ]]; then
+  SLUG=$(echo "$TITLE" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | sed 's/^-//;s/-$//')
+  FILENAME="${TS}-${SLUG}.md"
+else
+  FILENAME="${TS}-note.md"
+fi
+
+FILEPATH="$NOTES_DIR/$FILENAME"
+
+# Write the file
+{
+  if [[ -n "$TITLE" ]]; then
+    echo "# $TITLE"
+    echo ""
+  fi
+  echo "$BODY"
+} > "$FILEPATH"
+
+# Confirm
+echo ""
+gum style --foreground 78 "  Saved → ${BAUBLE_QUICK_DIR/#$HOME/\~}/$FILENAME"
+sleep 1.5
