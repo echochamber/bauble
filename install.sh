@@ -238,6 +238,42 @@ else
   fi
 fi
 
+# --- User config ---
+echo ""
+echo -e "${BOLD}${CYAN}=== User Config ===${RESET}"
+echo ""
+USER_CONF="$HOME/.config/bauble.conf"
+USER_CONF_TEMPLATE="$REPO_DIR/config/bauble.conf.example"
+
+if [[ -f "$USER_CONF" ]]; then
+  echo -e "  ${GREEN}Found${RESET} existing $USER_CONF — leaving it alone."
+elif [[ ! -f "$USER_CONF_TEMPLATE" ]]; then
+  echo -e "  ${YELLOW}Skipped${RESET} — template missing at $USER_CONF_TEMPLATE."
+elif $DRY_RUN; then
+  echo -e "  ${YELLOW}[dry-run] would offer to copy${RESET} $USER_CONF_TEMPLATE -> $USER_CONF"
+else
+  echo "  Bauble can copy a starter user-config to $USER_CONF (all values"
+  echo "  commented out — uncomment what you want to override). This is optional;"
+  echo "  bauble works fine with no user config."
+  echo ""
+  if $NON_INTERACTIVE; then
+    echo -e "  ${YELLOW}Skipped${RESET} (--non-interactive). Copy manually with:"
+    echo -e "    ${BOLD}cp $USER_CONF_TEMPLATE $USER_CONF${RESET}"
+  else
+    echo -n "  Copy starter config? [y/N]: "
+    read -r reply
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+      mkdir -p "$(dirname "$USER_CONF")"
+      cp "$USER_CONF_TEMPLATE" "$USER_CONF"
+      echo -e "  ${GREEN}Copied${RESET} starter config to $USER_CONF"
+    else
+      echo -e "  ${YELLOW}Skipped.${RESET} Copy later with:"
+      echo -e "    ${BOLD}cp $USER_CONF_TEMPLATE $USER_CONF${RESET}"
+    fi
+  fi
+fi
+echo ""
+
 # Check for optional dependencies
 _missing=()
 command -v glow &>/dev/null || _missing+=("glow (markdown viewer)")

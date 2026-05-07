@@ -30,18 +30,21 @@ cd bauble
 ./uninstall.sh          # remove symlinks
 ```
 
-Symlinks hooks to `~/.claude/hooks/` and scripts to `~/.claude/scripts/`. Prints hook entries to merge into `~/.claude/settings.json`.
+Symlinks hooks to `~/.claude/hooks/` and scripts to `~/.claude/scripts/`. Prints hook entries to merge into `~/.claude/settings.json`. The installer also offers (interactively, with `[y/N]`) to copy `config/bauble.conf.example` to `~/.config/bauble.conf` — a starter user-config with every variable commented out so you can uncomment only what you want to override. Skipping is fine; bauble works without it.
 
 ## tmux
 
-The install script adds `source-file` to `~/.tmux.conf` automatically. To change the gateway key from `prefix+g`:
+The install script adds `source-file` to `~/.tmux.conf` automatically. By default bauble only sets what its features require (key table, `allow-rename off`, `monitor-bell off`) — it won't touch your status bar or terminal-features. The status-bar widget and OSC 8 hyperlinks are opt-in via `@bauble-statusbar` and `@bauble-hyperlinks`; see [docs/tmux.md](docs/tmux.md).
 
-```bash
-# in bauble.tmux.conf, change this line:
-bind-key g switch-client -T bauble
+To change the gateway key from `prefix+g`:
+
+```tmux
+set -g @bauble-prefix a   # before sourcing bauble.tmux.conf
 ```
 
-See [docs/tmux.md](docs/tmux.md) for keybindings, status bar setup, hook events, and customization.
+## Pairs well with `/tui fullscreen`
+
+Claude Code's `/tui fullscreen` mode hides chrome and uses the full pane, so the only signals about agent state come from outside the TUI — exactly what bauble provides via tab colors and the status-bar widget. Toggle it inside any Claude pane to declutter without losing situational awareness.
 
 ![Permission prompt with colored pane states](screenshots/permission-prompt.png)
 

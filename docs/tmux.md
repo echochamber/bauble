@@ -4,12 +4,26 @@ Full reference for tmux integration. The install script adds `source-file` to `~
 
 ## What gets sourced
 
-`bauble.tmux.conf` configures:
+`bauble.tmux.conf` only sets what bauble's own features require — it does **not** touch your status bar, theme, or terminal-features unless you opt in.
 
-- `allow-rename off` — prevents processes from overriding window names (needed for `tmux-claim-bead`)
+Always set:
+
+- `allow-rename off` / `automatic-rename off` — prevents processes from overriding window names (needed for `tmux-claim-bead`)
 - `monitor-bell off` — bauble uses per-window styles instead of bell
 - Keybindings in the `bauble` key table (accessed via `prefix+g`)
 - Pane tint manual overrides (`g,y` and `g,Y`)
+
+Opt-in (set the option **before** sourcing `bauble.tmux.conf`):
+
+| Option | Value | Effect |
+|---|---|---|
+| `@bauble-prefix` | a key, e.g. `a` | Change gateway key from default `g` |
+| `@bauble-statusbar` | `on` | Append agent-status widget to `status-right` (uses `set -ag`, so it adds to whatever you already have) and set `status-interval 5` |
+| `@bauble-hyperlinks` | `xterm-ghostty`, `xterm-256color`, … | Enable OSC 8 hyperlinks for that terminfo name |
+
+## Pairs well with `/tui fullscreen`
+
+Claude Code's `/tui fullscreen` mode hides the TUI chrome — bauble's tab colors and status-bar widget keep you aware of agent state even when the TUI itself shows nothing extra. Useful when running one agent per pane and you want the cleanest possible view.
 
 ## Keybindings
 
@@ -44,9 +58,15 @@ tmux-claim-bead manapool-0ch
 
 ## Status bar
 
-Add the agent status widget to your tmux status bar:
+The simplest way is to opt in:
 
-```bash
+```tmux
+set -g @bauble-statusbar on   # before sourcing bauble.tmux.conf
+```
+
+That appends `#(~/.claude/scripts/tmux-agent-status)` to your existing `status-right` and sets `status-interval 5`. If you'd rather control placement yourself, leave the option off and add the widget wherever you want:
+
+```tmux
 set -g status-right '#(~/.claude/scripts/tmux-agent-status) %b %d  %H:%M'
 set -g status-interval 5
 ```
@@ -74,10 +94,9 @@ Reset hooks clear state back to working baseline on every new prompt or tool use
 
 **Sounds** — configure in `bauble.conf`: set `BAUBLE_SOUND_ENABLED=0` to disable, or `BAUBLE_SOUND_DONE`/`BAUBLE_SOUND_WAITING` to custom file paths. Cross-platform: uses system sounds on macOS (afplay) and Linux (pw-play/paplay/aplay).
 
-**Hyperlinks** — enable OSC 8 clickable `file://` URLs by uncommenting in `bauble.tmux.conf`:
+**Hyperlinks** — enable OSC 8 clickable `file://` URLs via the opt-in option (set before sourcing `bauble.tmux.conf`):
 
-```bash
-set -as terminal-features ',xterm-ghostty:hyperlinks'
-# or for iTerm2:
-set -as terminal-features ',xterm-256color:hyperlinks'
+```tmux
+set -g @bauble-hyperlinks xterm-ghostty       # Ghostty
+set -g @bauble-hyperlinks xterm-256color      # iTerm2 / most others
 ```

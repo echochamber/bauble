@@ -1,0 +1,75 @@
+# Bauble user configuration — copy to ~/.config/bauble.conf and edit.
+#
+# Every variable below is commented out and shows the bauble default. Uncomment
+# only what you want to change. Anything left commented falls back to the
+# default in the bauble repo's config/bauble.conf, so this file stays small
+# and your overrides are obvious.
+#
+# This file is sourced as bash. Only point BAUBLE_CONFIG at files you trust.
+
+# ── Paths ──
+
+# Directory for saved snapshots (glow viewer "s" save action)
+# BAUBLE_SNAPS_DIR="$HOME/notes/snaps"
+
+# Directory for quick capture notes
+# BAUBLE_QUICK_DIR="$HOME/notes/quick"
+
+# Base directory for notes browsing (tmux-notes)
+# BAUBLE_NOTES_DIR="$HOME/notes"
+
+# ── Behavior ──
+
+# Maximum items to show in popup menus (markdown viewer, diff viewer, etc.)
+# BAUBLE_MAX_MENU_ITEMS=8
+
+# Number of scrollback lines to scan in the current pane.
+# Use "-" (or empty) for full scrollback. Larger = slower but finds older paths.
+# BAUBLE_SCROLLBACK_LINES=5000
+
+# Seconds of staleness before marking a Claude session as cancelled.
+# BAUBLE_CANCEL_THRESHOLD=30
+
+# Default split width for side viewers (glow, diff, files).
+# BAUBLE_SPLIT_WIDTH=100
+
+# Auto-rename tmux windows to "claude" when they still have a default name.
+# Off by default (bauble already sets `automatic-rename off`). Set to 1 to opt in.
+# BAUBLE_AUTO_RENAME=0
+
+# ── Sounds ──
+
+# Enable/disable sound alerts (set to 0 to silence everything)
+# BAUBLE_SOUND_ENABLED=1
+
+# Override the default platform sounds with your own files
+# BAUBLE_SOUND_DONE="/path/to/done.wav"
+# BAUBLE_SOUND_WAITING="/path/to/waiting.wav"
+
+# ── Screenshots ──
+
+# Directory to scan for screenshots. Default is auto-detected:
+#   macOS: `defaults read com.apple.screencapture location` (or ~/Desktop)
+#   Linux: $XDG_PICTURES_DIR (or ~/Pictures, ~/Desktop)
+# BAUBLE_SCREENSHOT_DIR="$HOME/Desktop"
+
+# Match screenshots by filename pattern (1) or just pick the most recent (0)
+# BAUBLE_SCREENSHOT_BY_NAME=1
+
+# Python strftime for screenshot timestamps. Default matches macOS:
+# "Screenshot 2026-02-26 at 6.58.14 PM.png"
+# BAUBLE_SCREENSHOT_TIME_FMT="%Y-%m-%d at %-I.%M.%S %p"
+
+# ── State colors (hex) ──
+
+# Pane background tint
+# BAUBLE_COLOR_WORKING="#1a1e2e"
+# BAUBLE_COLOR_WAITING="#302a1a"
+# BAUBLE_COLOR_DONE="#192b1e"
+# BAUBLE_COLOR_CANCELLED="#2b1a1a"
+
+# Tab bar styles (tmux format)
+# BAUBLE_TAB_WORKING="default"
+# BAUBLE_TAB_WAITING="bg=yellow,fg=black,bold"
+# BAUBLE_TAB_DONE="bg=green,fg=black,bold"
+# BAUBLE_TAB_CANCELLED="bg=red,fg=white,bold"
