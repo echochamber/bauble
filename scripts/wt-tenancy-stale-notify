@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# wt-tenancy-stale-notify — daily OS notification for stale tenancies
+#
+# Posts a macOS notification when tenancies are idle past the threshold.
+# Click opens the state JSON in the default viewer.
+
+set -u
+
+WT_TENANCY="${WT_TENANCY_BIN:-$HOME/.claude/scripts/wt-tenancy}"
+DAYS="${WT_TENANCY_STALE_DAYS:-7}"
+LOG="${WT_TENANCY_STALE_LOG:-$HOME/.claude/wt-tenancy-stale.log}"
+
+[ -x "$WT_TENANCY" ] || exit 0
+
+STATE_PATH=$("$WT_TENANCY" state-path)
+COUNT=$("$WT_TENANCY" stale --days "$DAYS" --json 2>/dev/null | jq length 2>/dev/null || echo 0)
+
+{
+  echo "--- $(date -u +%FT%TZ) stale-notify run (days=$DAYS) ---"
+  echo "stale count: $COUNT"
+} >> "$LOG"
+
+[ "$COUNT" = "0" ] && exit 0
+
+TITLE="Worktree tenancy"
+MESSAGE="$COUNT worktree(s) idle > ${DAYS}d. Click to review."
+
+if command -v terminal-notifier >/dev/null 2>&1; then
+  terminal-notifier \
+    -title "$TITLE" \
+    -message "$MESSAGE" \
+    -execute "open $STATE_PATH" \
+    -group "wt-tenancy-stale" >/dev/null 2>&1 || true
+elif [ "$(uname -s)" = "Darwin" ]; then
+  # osascript fallback — no click action, just an alert.
+  osascript -e "display notification \"$MESSAGE\" with title \"$TITLE\"" >/dev/null 2>&1 || true
+fi
+
+exit 0

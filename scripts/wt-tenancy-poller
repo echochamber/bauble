@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# wt-tenancy-poller — launchd-driven gc poller
+#
+# Runs `wt-tenancy gc` to release tenancies whose PRs have merged.
+# Safety-net for crashed sessions and web-merges that the SessionEnd hook misses.
+
+set -u
+
+WT_TENANCY="${WT_TENANCY_BIN:-$HOME/.claude/scripts/wt-tenancy}"
+LOG="${WT_TENANCY_POLLER_LOG:-$HOME/.claude/wt-tenancy-poller.log}"
+
+if [ ! -x "$WT_TENANCY" ]; then
+  echo "$(date -u +%FT%TZ) poller: wt-tenancy not found at $WT_TENANCY" >> "$LOG"
+  exit 0
+fi
+
+{
+  echo "--- $(date -u +%FT%TZ) poller run ---"
+  "$WT_TENANCY" gc 2>&1
+} >> "$LOG"

@@ -62,12 +62,26 @@
         ]
       }
     ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/wt-tenancy-session-start.sh"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "bash ~/.claude/hooks/pane-cleanup.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/wt-tenancy-session-end.sh"
           }
         ]
       }

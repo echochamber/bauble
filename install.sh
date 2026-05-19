@@ -109,6 +109,12 @@ FILES=(
   "scripts/tmux-cheatsheet:$HOME/.claude/scripts/tmux-cheatsheet"
   "scripts/tmux-paste-screenshot:$HOME/.claude/scripts/tmux-paste-screenshot"
   "scripts/bauble-play-sound:$HOME/.claude/scripts/bauble-play-sound"
+  # Worktree tenancy
+  "scripts/wt-tenancy:$HOME/.claude/scripts/wt-tenancy"
+  "scripts/wt-tenancy-poller:$HOME/.claude/scripts/wt-tenancy-poller"
+  "scripts/wt-tenancy-stale-notify:$HOME/.claude/scripts/wt-tenancy-stale-notify"
+  "hooks/wt-tenancy-session-start.sh:$HOME/.claude/hooks/wt-tenancy-session-start.sh"
+  "hooks/wt-tenancy-session-end.sh:$HOME/.claude/hooks/wt-tenancy-session-end.sh"
 )
 
 # --- Counters ---

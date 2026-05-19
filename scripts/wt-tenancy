@@ -1,0 +1,681 @@
+#!/usr/bin/env bash
+# wt-tenancy — Worktree tenancy manager for Chaimber
+#
+# Tracks which git worktrees are currently "claimed" by a Claude Code session.
+# State lives in ~/.claude/worktree-tenancy.json (flock-guarded for concurrency).
+#
+# Pool model:
+#   Worktrees are generic slots named {reponame}_tenant_N (1-indexed),
+#   stored as siblings of the main repo. Slots are claimed on demand,
+#   released after work is merged (or manually), and reused later.
+#
+# See SKILL.md (worktree-tenancy) for verbs the agent uses.
+
+set -euo pipefail
+
+STATE_FILE="${WT_TENANCY_STATE:-$HOME/.claude/worktree-tenancy.json}"
+LOCK_FILE="${WT_TENANCY_LOCK:-$HOME/.claude/worktree-tenancy.lock}"
+SOFT_CAP="${WT_TENANCY_SOFT_CAP:-15}"
+STALE_DAYS_DEFAULT=7
+
+# --- bootstrap ---
+mkdir -p "$(dirname "$STATE_FILE")"
+if [ ! -f "$STATE_FILE" ]; then
+  echo '{"version":1,"tenancies":[]}' > "$STATE_FILE"
+fi
+[ -e "$LOCK_FILE" ] || : > "$LOCK_FILE"
+
+# --- helpers ---
+die() { echo "wt-tenancy: $*" >&2; exit 1; }
+
+have_jq() { command -v jq >/dev/null 2>&1; }
+have_jq || die "jq is required"
+
+have_flock() { command -v flock >/dev/null 2>&1; }
+
+# Open fd 9 on the lock file for the duration of a critical section.
+# Usage: with_lock <subshell-body>
+with_lock() {
+  if have_flock; then
+    (
+      flock -x 9
+      "$@"
+    ) 9>"$LOCK_FILE"
+  else
+    "$@"
+  fi
+}
+
+# Read current state JSON (no locking — callers requiring atomicity must lock)
+read_state() { cat "$STATE_FILE"; }
+
+# Write state JSON atomically (tmpfile + rename within same dir)
+write_state() {
+  local tmp
+  tmp="$(mktemp "${STATE_FILE}.XXXXXX")"
+  cat > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# Canonicalize a path so /tmp vs /private/tmp (macOS), trailing slashes, and
+# symlinks all collapse to one form. Used everywhere paths are stored or
+# looked up, so SessionStart hooks and claim-time storage agree.
+canonical_path() {
+  local p="$1"
+  if [ -d "$p" ]; then
+    ( cd "$p" 2>/dev/null && pwd -P ) || echo "$p"
+  else
+    # For non-existent paths (e.g. about-to-create), canonicalize the parent
+    # and re-attach the basename.
+    local parent base
+    parent="$(dirname "$p")"
+    base="$(basename "$p")"
+    if [ -d "$parent" ]; then
+      printf '%s/%s\n' "$( cd "$parent" && pwd -P )" "$base"
+    else
+      echo "$p"
+    fi
+  fi
+}
+
+# Resolve the main repo root (i.e. the non-worktree clone) for the cwd.
+# `git rev-parse --show-toplevel` returns the worktree root; we need the
+# "main worktree" so the pool path is consistent across slots.
+repo_main_root() {
+  local common_dir
+  common_dir=$(git rev-parse --git-common-dir 2>/dev/null) || return 1
+  canonical_path "$(dirname "$common_dir")"
+}
+
+repo_name_from_root() { basename "$1"; }
+
+repo_parent_from_root() { dirname "$1"; }
+
+# Read default base branch from .claude/chamber.config (worktree.default_base),
+# else from origin/HEAD symbolic ref, else "main".
+detect_base_branch() {
+  local repo_root="$1"
+  local config_file="$repo_root/.claude/chamber.config"
+  if [ -f "$config_file" ]; then
+    local cfg_base
+    cfg_base=$(jq -r '.worktree.default_base // empty' "$config_file" 2>/dev/null || true)
+    if [ -n "$cfg_base" ]; then
+      echo "$cfg_base"
+      return
+    fi
+  fi
+  local remote_head
+  remote_head=$(git -C "$repo_root" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null || true)
+  if [ -n "$remote_head" ]; then
+    echo "${remote_head##refs/remotes/origin/}"
+    return
+  fi
+  echo "main"
+}
+
+# Highest slot_n recorded for a repo (across active + free). Echoes 0 if none.
+max_slot_for_repo() {
+  local repo="$1"
+  jq -r --arg repo "$repo" '
+    [.tenancies[] | select(.repo == $repo) | .slot_n] | (max // 0)
+  ' "$STATE_FILE"
+}
+
+# Count slots for a repo (active + free).
+slot_count_for_repo() {
+  local repo="$1"
+  jq -r --arg repo "$repo" '
+    [.tenancies[] | select(.repo == $repo)] | length
+  ' "$STATE_FILE"
+}
+
+# Find an existing tenancy by exact worktree_path. Echoes JSON object or empty.
+# Caller is expected to have already canonicalized the path.
+find_by_path() {
+  local path="$1"
+  jq -c --arg p "$path" '[.tenancies[] | select(.worktree_path == $p)][0] // empty' "$STATE_FILE"
+}
+
+# Find first active tenancy for repo+branch. Echoes JSON object or empty.
+find_active_by_branch() {
+  local repo="$1" branch="$2"
+  jq -c --arg repo "$repo" --arg b "$branch" '
+    [.tenancies[] | select(.repo == $repo and .branch == $b and .status == "active")][0] // empty
+  ' "$STATE_FILE"
+}
+
+# Find first free tenancy for repo. Echoes JSON object or empty.
+find_free_for_repo() {
+  local repo="$1"
+  jq -c --arg repo "$repo" '
+    [.tenancies[] | select(.repo == $repo and .status == "free")][0] // empty
+  ' "$STATE_FILE"
+}
+
+# Upsert: replace tenancy at path if present, else append.
+# Entry JSON may come from $2 (preferred — avoids subshell stdin issues) or stdin.
+upsert_tenancy() {
+  local path="$1"
+  local entry="${2:-}"
+  if [ -z "$entry" ]; then
+    entry=$(cat)
+  fi
+  local newstate
+  newstate=$(jq --arg p "$path" --argjson entry "$entry" '
+    .tenancies |= (
+      if any(.[]; .worktree_path == $p) then
+        map(if .worktree_path == $p then $entry else . end)
+      else
+        . + [$entry]
+      end
+    )
+  ' "$STATE_FILE")
+  printf '%s\n' "$newstate" | write_state
+}
+
+# Remove tenancy at path entirely.
+remove_tenancy() {
+  local path="$1"
+  local newstate
+  newstate=$(jq --arg p "$path" '.tenancies |= map(select(.worktree_path != $p))' "$STATE_FILE")
+  printf '%s\n' "$newstate" | write_state
+}
+
+# Check if path's git status is clean (no uncommitted changes).
+# Returns 0 if clean, 1 with stderr describing what's dirty.
+check_clean() {
+  local path="$1"
+  local dirty
+  dirty=$(git -C "$path" status --porcelain 2>/dev/null || true)
+  if [ -n "$dirty" ]; then
+    echo "$dirty"
+    return 1
+  fi
+  return 0
+}
+
+# Check upstream is up-to-date with local (no unpushed commits).
+# Returns 0 if pushed, 1 with stderr summary if there are unpushed commits.
+# If branch has no upstream and HEAD is not detached, treats as unpushed.
+check_pushed() {
+  local path="$1"
+  # Detached HEAD on a remote ref is fine for our "free" state.
+  if ! git -C "$path" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    return 0
+  fi
+  local upstream
+  upstream=$(git -C "$path" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+  if [ -z "$upstream" ]; then
+    # No upstream and we're on a branch — treat as unpushed
+    echo "(branch has no upstream — push it first)"
+    return 1
+  fi
+  local unpushed
+  unpushed=$(git -C "$path" rev-list --left-only --count "HEAD...$upstream" 2>/dev/null || echo 0)
+  if [ "$unpushed" != "0" ]; then
+    echo "$unpushed unpushed commit(s) on $(git -C "$path" rev-parse --abbrev-ref HEAD)"
+    return 1
+  fi
+  return 0
+}
+
+# --- subcommands ---
+
+cmd_help() {
+  cat <<'EOF'
+wt-tenancy — pool-based git worktree tenancy
+
+USAGE
+  wt-tenancy <command> [args]
+
+COMMANDS
+  list [--json]                          List all tenancies (active + free)
+  status [PATH]                          Show tenancy for PATH (default: cwd worktree)
+  pool [REPO_NAME]                       Show slot inventory for repo (default: cwd repo)
+  claim-or-create BRANCH [opts]          Get a tenant path for BRANCH; reuses or grows
+  claim PATH BRANCH [opts]               Mark an existing worktree PATH as claimed
+  release [PATH] [--force]               Release tenancy (refuses if dirty/unpushed)
+  adopt PATH [opts]                      Adopt an existing worktree into tenancy
+  stale [--days N] [--json]              List tenancies idle > N days (default 7)
+  gc                                     Check PRs for active tenancies; auto-release merged
+  refresh-session [PATH] [--session-id]  Bump last_session_at for cwd's tenancy
+  remove PATH                            Forcibly remove tenancy entry (no git changes)
+  state-path                             Print the state file path
+
+OPTIONS for claim-or-create / claim / adopt
+  --issue OWNER/REPO#N   GitHub issue (optional)
+  --pr N                 GitHub PR number (optional)
+  --base BRANCH          Base branch for new worktrees (default from chamber.config or origin/HEAD)
+  --session-id ID        Record session id
+
+ENV
+  WT_TENANCY_STATE        State file (default: ~/.claude/worktree-tenancy.json)
+  WT_TENANCY_LOCK         Lock file (default: ~/.claude/worktree-tenancy.lock)
+  WT_TENANCY_SOFT_CAP     Soft cap on slots per repo (default: 15)
+EOF
+}
+
+cmd_state_path() { echo "$STATE_FILE"; }
+
+cmd_list() {
+  local json=false
+  for a in "$@"; do
+    case "$a" in
+      --json) json=true ;;
+      *) die "unknown flag: $a" ;;
+    esac
+  done
+  if $json; then
+    cat "$STATE_FILE"
+    return
+  fi
+  local count
+  count=$(jq '.tenancies | length' "$STATE_FILE")
+  if [ "$count" = "0" ]; then
+    echo "(no tenancies)"
+    return
+  fi
+  printf '%-6s  %-9s  %-22s  %-30s  %s\n' STATUS SLOT BRANCH REPO PATH
+  jq -r '.tenancies[] | [.status, ("tenant_" + (.slot_n|tostring)), (.branch // "-"), .repo, .worktree_path] | @tsv' "$STATE_FILE" \
+    | awk -F'\t' '{ printf "%-6s  %-9s  %-22s  %-30s  %s\n", $1, $2, $3, $4, $5 }'
+}
+
+cmd_status() {
+  local path="${1:-}"
+  if [ -z "$path" ]; then
+    path=$(git rev-parse --show-toplevel 2>/dev/null) || die "not in a git worktree (pass PATH explicitly)"
+  fi
+  path=$(canonical_path "$path")
+  local entry
+  entry=$(find_by_path "$path")
+  if [ -z "$entry" ]; then
+    echo "(no tenancy for $path)"
+    return 1
+  fi
+  echo "$entry" | jq .
+}
+
+cmd_pool() {
+  local repo="${1:-}"
+  if [ -z "$repo" ]; then
+    local root
+    root=$(repo_main_root) || die "not in a git repo (pass REPO_NAME)"
+    repo=$(repo_name_from_root "$root")
+  fi
+  local total active free
+  total=$(slot_count_for_repo "$repo")
+  active=$(jq -r --arg r "$repo" '[.tenancies[]|select(.repo==$r and .status=="active")]|length' "$STATE_FILE")
+  free=$(jq -r --arg r "$repo" '[.tenancies[]|select(.repo==$r and .status=="free")]|length' "$STATE_FILE")
+  echo "repo: $repo    slots: $total (active=$active, free=$free)    cap: $SOFT_CAP"
+  jq -r --arg r "$repo" '
+    .tenancies[] | select(.repo==$r) |
+    [("tenant_" + (.slot_n|tostring)), .status, (.branch // "-"), .worktree_path] | @tsv
+  ' "$STATE_FILE" \
+    | sort \
+    | awk -F'\t' '{ printf "  %-10s  %-6s  %-22s  %s\n", $1, $2, $3, $4 }'
+}
+
+# Internal: parse claim/adopt option flags. Sets globals: OPT_ISSUE OPT_PR OPT_BASE OPT_SESSION OPT_FORCE OPT_FORCE_GROW
+parse_opts() {
+  OPT_ISSUE=""
+  OPT_PR=""
+  OPT_BASE=""
+  OPT_SESSION=""
+  OPT_FORCE=false
+  OPT_FORCE_GROW=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --issue) OPT_ISSUE="$2"; shift 2 ;;
+      --pr) OPT_PR="$2"; shift 2 ;;
+      --base) OPT_BASE="$2"; shift 2 ;;
+      --session-id) OPT_SESSION="$2"; shift 2 ;;
+      --force) OPT_FORCE=true; shift ;;
+      --force-grow) OPT_FORCE_GROW=true; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+}
+
+# Build a tenancy JSON entry. Fields not relevant left null/missing.
+make_entry() {
+  local status="$1" slot_n="$2" path="$3" repo="$4" branch="$5"
+  local now
+  now=$(now_iso)
+  jq -n \
+    --arg status "$status" \
+    --argjson slot "$slot_n" \
+    --arg path "$path" \
+    --arg repo "$repo" \
+    --arg branch "$branch" \
+    --arg now "$now" \
+    --arg issue "$OPT_ISSUE" \
+    --arg pr "$OPT_PR" \
+    --arg session "$OPT_SESSION" \
+    '{
+      worktree_path: $path,
+      repo: $repo,
+      slot_n: $slot,
+      branch: (if $branch == "" then null else $branch end),
+      status: $status,
+      claimed_at: $now,
+      last_session_at: $now,
+      session_id: (if $session == "" then null else $session end),
+      github_issue: (if $issue == "" then null else $issue end),
+      pr_number: (if $pr == "" then null else $pr end),
+      pr_state: null
+    } | with_entries(select(.value != null))'
+}
+
+# adopt: register an existing worktree into tenancy without creating anything new.
+cmd_adopt() {
+  local path="${1:?usage: adopt PATH [opts]}"
+  shift
+  parse_opts "$@"
+  [ -d "$path/.git" ] || [ -f "$path/.git" ] || die "not a git worktree: $path"
+  path=$(canonical_path "$path")
+  local repo_root repo branch
+  repo_root=$(git -C "$path" rev-parse --git-common-dir | xargs dirname)
+  repo_root=$(canonical_path "$repo_root")
+  repo=$(repo_name_from_root "$repo_root")
+  branch=$(git -C "$path" symbolic-ref --short -q HEAD 2>/dev/null || echo "")
+  # Try to infer slot number from path basename ({repo}_tenant_N)
+  local base slot_n
+  base=$(basename "$path")
+  if [[ "$base" =~ ^${repo}_tenant_([0-9]+)$ ]]; then
+    slot_n="${BASH_REMATCH[1]}"
+  else
+    # Adopted non-pool worktree: use max+1 so it doesn't collide
+    slot_n=$(($(max_slot_for_repo "$repo") + 1))
+  fi
+  with_lock _adopt_locked "$path" "$repo" "$branch" "$slot_n"
+  echo "$path"
+}
+_adopt_locked() {
+  local path="$1" repo="$2" branch="$3" slot_n="$4"
+  make_entry "active" "$slot_n" "$path" "$repo" "$branch" | upsert_tenancy "$path"
+}
+
+# claim: mark an already-existing worktree path as actively claimed.
+cmd_claim() {
+  local path="${1:?usage: claim PATH BRANCH [opts]}"
+  local branch="${2:?usage: claim PATH BRANCH [opts]}"
+  shift 2
+  parse_opts "$@"
+  [ -d "$path" ] || die "no such worktree: $path"
+  path=$(canonical_path "$path")
+  local repo_root repo
+  repo_root=$(git -C "$path" rev-parse --git-common-dir | xargs dirname)
+  repo_root=$(canonical_path "$repo_root")
+  repo=$(repo_name_from_root "$repo_root")
+  local base slot_n
+  base=$(basename "$path")
+  if [[ "$base" =~ ^${repo}_tenant_([0-9]+)$ ]]; then
+    slot_n="${BASH_REMATCH[1]}"
+  else
+    slot_n=$(($(max_slot_for_repo "$repo") + 1))
+  fi
+  with_lock _claim_locked "$path" "$repo" "$branch" "$slot_n"
+  echo "$path"
+}
+_claim_locked() {
+  local path="$1" repo="$2" branch="$3" slot_n="$4"
+  make_entry "active" "$slot_n" "$path" "$repo" "$branch" | upsert_tenancy "$path"
+}
+
+# claim-or-create: the main flow Claude uses to get a worktree for a branch.
+#   1. If active tenancy on (repo, branch) already exists → return its path (idempotent)
+#   2. If a free slot for repo exists → claim it, checkout branch
+#   3. Else grow pool (respecting SOFT_CAP) → claim new slot, create branch
+cmd_claim_or_create() {
+  local branch="${1:?usage: claim-or-create BRANCH [opts]}"
+  shift
+  parse_opts "$@"
+  local repo_root repo parent base
+  repo_root=$(repo_main_root) || die "not in a git repo"
+  repo=$(repo_name_from_root "$repo_root")
+  parent=$(repo_parent_from_root "$repo_root")
+  base="${OPT_BASE:-$(detect_base_branch "$repo_root")}"
+
+  # 1. Existing active claim for this branch?
+  local existing
+  existing=$(find_active_by_branch "$repo" "$branch")
+  if [ -n "$existing" ]; then
+    echo "$existing" | jq -r .worktree_path
+    return 0
+  fi
+
+  # 2. Free slot available?
+  local free
+  free=$(find_free_for_repo "$repo")
+  if [ -n "$free" ]; then
+    local path slot_n
+    path=$(echo "$free" | jq -r .worktree_path)
+    slot_n=$(echo "$free" | jq -r .slot_n)
+    _checkout_in_worktree "$path" "$branch" "$base"
+    with_lock _claim_locked "$path" "$repo" "$branch" "$slot_n"
+    echo "$path"
+    return 0
+  fi
+
+  # 3. Grow pool.
+  local count next_n
+  count=$(slot_count_for_repo "$repo")
+  if [ "$count" -ge "$SOFT_CAP" ] && ! $OPT_FORCE_GROW; then
+    die "soft cap reached for $repo ($count >= $SOFT_CAP slots). Pass --force-grow to override, or release a slot."
+  fi
+  next_n=$(($(max_slot_for_repo "$repo") + 1))
+  local path="$parent/${repo}_tenant_${next_n}"
+  if [ -e "$path" ]; then
+    die "would-be slot path already exists outside of tenancy: $path (run 'wt-tenancy adopt $path' to incorporate)"
+  fi
+  _create_worktree "$repo_root" "$path" "$branch" "$base"
+  path=$(canonical_path "$path")
+  with_lock _claim_locked "$path" "$repo" "$branch" "$next_n"
+  echo "$path"
+}
+
+# Create a new worktree at PATH on BRANCH. If branch doesn't exist locally, create from origin/BASE.
+_create_worktree() {
+  local repo_root="$1" path="$2" branch="$3" base="$4"
+  # Best-effort fetch so origin/base is current
+  git -C "$repo_root" fetch origin --quiet --prune 2>/dev/null || true
+  if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$repo_root" worktree add "$path" "$branch" >&2
+  elif git -C "$repo_root" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git -C "$repo_root" worktree add -b "$branch" "$path" "origin/$branch" >&2
+  else
+    git -C "$repo_root" worktree add -b "$branch" "$path" "origin/$base" >&2
+  fi
+}
+
+# Move an existing (free) worktree onto BRANCH, creating the branch if needed.
+_checkout_in_worktree() {
+  local path="$1" branch="$2" base="$3"
+  git -C "$path" fetch origin --quiet --prune 2>/dev/null || true
+  if git -C "$path" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$path" checkout "$branch" >&2
+  elif git -C "$path" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git -C "$path" checkout -b "$branch" "origin/$branch" >&2
+  else
+    git -C "$path" checkout -b "$branch" "origin/$base" >&2
+  fi
+}
+
+# release: mark tenancy as free. Refuses if dirty/unpushed unless --force.
+# After release, checkout origin/<base> in detached HEAD so slot is "neutral".
+cmd_release() {
+  local path=""
+  local force=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=true; shift ;;
+      *) path="$1"; shift ;;
+    esac
+  done
+  if [ -z "$path" ]; then
+    path=$(git rev-parse --show-toplevel 2>/dev/null) || die "not in a git worktree (pass PATH)"
+  fi
+  path=$(canonical_path "$path")
+  local entry
+  entry=$(find_by_path "$path")
+  [ -n "$entry" ] || die "no tenancy for $path"
+
+  if ! $force; then
+    local dirty
+    if ! dirty=$(check_clean "$path"); then
+      echo "release refused: uncommitted changes in $path" >&2
+      echo "$dirty" >&2
+      echo "Commit or stash, then retry. Use --force to release anyway." >&2
+      exit 2
+    fi
+    local pushed_err
+    if ! pushed_err=$(check_pushed "$path"); then
+      echo "release refused: $pushed_err" >&2
+      echo "Push, then retry. Use --force to release anyway." >&2
+      exit 2
+    fi
+  fi
+
+  # Reset slot to detached HEAD on origin/base for cleanliness.
+  local repo_root base
+  repo_root=$(git -C "$path" rev-parse --git-common-dir | xargs dirname)
+  repo_root=$(cd "$repo_root" && pwd)
+  base=$(detect_base_branch "$repo_root")
+  git -C "$path" fetch origin --quiet --prune 2>/dev/null || true
+  git -C "$path" checkout --detach "origin/$base" 1>&2 || \
+    git -C "$path" checkout --detach "$base" 1>&2 || true
+
+  # Persist as free
+  local now new_entry
+  now=$(now_iso)
+  new_entry=$(echo "$entry" | jq --arg now "$now" '
+    .status = "free"
+    | .branch = null
+    | .released_at = $now
+    | del(.session_id)
+  ')
+  with_lock upsert_tenancy "$path" "$new_entry"
+  echo "released: $path"
+}
+
+cmd_refresh_session() {
+  local path="" session=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session-id) session="$2"; shift 2 ;;
+      *) path="$1"; shift ;;
+    esac
+  done
+  if [ -z "$path" ]; then
+    path=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  fi
+  path=$(canonical_path "$path")
+  local entry
+  entry=$(find_by_path "$path")
+  [ -n "$entry" ] || return 0  # not tracked is fine
+  local now updated
+  now=$(now_iso)
+  updated=$(echo "$entry" | jq --arg now "$now" --arg sid "$session" '
+    .last_session_at = $now
+    | (if $sid != "" then .session_id = $sid else . end)
+    | .status = (if .status == "free" then "active" else .status end)
+  ')
+  with_lock upsert_tenancy "$path" "$updated"
+}
+
+cmd_stale() {
+  local days="$STALE_DAYS_DEFAULT" json=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --days) days="$2"; shift 2 ;;
+      --json) json=true; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  # cutoff = now - days*86400 in epoch seconds
+  local cutoff
+  cutoff=$(($(date +%s) - days * 86400))
+  local result
+  result=$(jq --argjson cutoff "$cutoff" '
+    .tenancies
+    | map(select(.status == "active"))
+    | map(. + {last_session_epoch: (.last_session_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0)})
+    | map(select(.last_session_epoch < $cutoff))
+    | map(del(.last_session_epoch))
+  ' "$STATE_FILE")
+  if $json; then
+    echo "$result"
+    return
+  fi
+  local count
+  count=$(echo "$result" | jq length)
+  if [ "$count" = "0" ]; then
+    echo "(no stale tenancies; threshold ${days}d)"
+    return
+  fi
+  echo "$count stale tenancies (idle > ${days}d):"
+  echo "$result" | jq -r '.[] | "  " + .worktree_path + "  [branch=" + (.branch//"-") + ", idle since " + .last_session_at + "]"'
+}
+
+# gc: walk active tenancies; if PR is merged, auto-release.
+# Requires `gh` CLI. Best-effort: silently skips if gh missing or auth absent.
+cmd_gc() {
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "gc: gh CLI not available; skipping" >&2
+    return 0
+  fi
+  local entries
+  entries=$(jq -c '.tenancies[] | select(.status == "active" and .pr_number != null)' "$STATE_FILE")
+  if [ -z "$entries" ]; then
+    echo "gc: no active tenancies with PRs"
+    return 0
+  fi
+  local released=0
+  while IFS= read -r entry; do
+    local path pr_num
+    path=$(echo "$entry" | jq -r .worktree_path)
+    pr_num=$(echo "$entry" | jq -r .pr_number)
+    [ -d "$path" ] || continue
+    local state
+    state=$(gh -R "$(git -C "$path" remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]([^/]+/[^/.]+)(\.git)?#\1#')" pr view "$pr_num" --json state -q .state 2>/dev/null || echo "")
+    if [ "$state" = "MERGED" ]; then
+      # Auto-release if clean; else flag but keep active
+      if "$0" release "$path" >/dev/null 2>&1; then
+        echo "gc: released $path (PR #$pr_num merged)"
+        released=$((released + 1))
+      else
+        echo "gc: PR #$pr_num merged but $path is dirty; left active" >&2
+      fi
+    fi
+  done <<< "$entries"
+  echo "gc: released $released tenancies"
+}
+
+cmd_remove() {
+  local path="${1:?usage: remove PATH}"
+  path=$(canonical_path "$path")
+  with_lock remove_tenancy "$path"
+  echo "removed tenancy entry: $path"
+}
+
+# --- dispatch ---
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  list)              cmd_list "$@" ;;
+  status)            cmd_status "$@" ;;
+  pool)              cmd_pool "$@" ;;
+  claim-or-create)   cmd_claim_or_create "$@" ;;
+  claim)             cmd_claim "$@" ;;
+  release)           cmd_release "$@" ;;
+  adopt)             cmd_adopt "$@" ;;
+  stale)             cmd_stale "$@" ;;
+  gc)                cmd_gc "$@" ;;
+  refresh-session)   cmd_refresh_session "$@" ;;
+  remove)            cmd_remove "$@" ;;
+  state-path)        cmd_state_path "$@" ;;
+  help|-h|--help)    cmd_help ;;
+  *) die "unknown command: $cmd  (try: wt-tenancy help)" ;;
+esac
